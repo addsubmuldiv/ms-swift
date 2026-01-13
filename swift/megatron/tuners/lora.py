@@ -62,7 +62,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         self.is_grouped = isinstance(base_layer, TEGroupedLinear)
         self.fan_in_fan_out = fan_in_fan_out
         self._active_adapter = adapter_name
-        self.is_expert = getattr(base_layer, 'is_expert', False)
+        self.is_expert = getattr(base_layer, 'is_expert', False) or getattr(
+            base_layer, 'explicit_expert_comm', False)
         self.sequence_parallel = getattr(base_layer, 'sequence_parallel', False)
         if self.is_expert:
             self.tp_size = get_expert_tensor_parallel_world_size()
@@ -158,6 +159,9 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         else:
             if is_torch_npu_available():
                 out_features = self.out_features
+                if getattr(self.base_layer, 'explicit_expert_comm', False):
+                    out_features = out_features * self.tp_size
+                # print(f"Using npu for LoRA layer, out_features: {out_features}, is expert: {getattr(self.base_layer, 'explicit_expert_comm', False)}")
             else:
                 out_features = self.out_features * self.tp_size
             if self.is_grouped:
