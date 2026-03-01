@@ -16,6 +16,34 @@ from swift.utils import (activate_parameters, find_all_linears, find_embedding, 
 logger = get_logger()
 
 
+def _format_lora_config_log(lora_config) -> str:
+    target_modules = getattr(lora_config, 'target_modules', None)
+    target_parameters = getattr(lora_config, 'target_parameters', None)
+    modules_to_save = getattr(lora_config, 'modules_to_save', None)
+
+    if isinstance(target_modules, list):
+        target_modules_info = f'list[{len(target_modules)}]'
+    elif isinstance(target_modules, str):
+        target_modules_info = 'regex'
+    else:
+        target_modules_info = str(type(target_modules).__name__)
+
+    target_parameters_count = len(target_parameters) if isinstance(target_parameters, list) else 0
+    modules_to_save_count = len(modules_to_save) if isinstance(modules_to_save, list) else 0
+
+    return (
+        'lora_config: '
+        f'task_type={getattr(lora_config, "task_type", None)}, '
+        f'r={getattr(lora_config, "r", None)}, '
+        f'lora_alpha={getattr(lora_config, "lora_alpha", None)}, '
+        f'lora_dropout={getattr(lora_config, "lora_dropout", None)}, '
+        f'bias={getattr(lora_config, "bias", None)}, '
+        f'target_modules={target_modules_info}, '
+        f'target_parameters_count={target_parameters_count}, '
+        f'modules_to_save_count={modules_to_save_count}'
+    )
+
+
 def apply_liger(model_type: str):
     try:
         from liger_kernel.transformers import (apply_liger_kernel_to_gemma, apply_liger_kernel_to_llama,
@@ -163,7 +191,7 @@ def prepare_adapter(args: SftArguments, model, *, template=None, train_dataset=N
         if args.use_swift_lora:
             lora_config = LoRAConfig(lora_dtype=args.lora_dtype, **lora_kwargs)
             model = Swift.prepare_model(model, lora_config)
-            logger.info(f'lora_config: {lora_config}')
+            logger.info(_format_lora_config_log(lora_config))
         elif args.tuner_backend == 'peft':
             if task_type == 'EMBEDDING':
                 task_type = None
@@ -198,7 +226,7 @@ def prepare_adapter(args: SftArguments, model, *, template=None, train_dataset=N
                 )
             else:
                 model = Swift.prepare_model(model, lora_config)
-            logger.info(f'lora_config: {lora_config}')
+            logger.info(_format_lora_config_log(lora_config))
         elif args.tuner_backend == 'unsloth':
             if args.resume_from_checkpoint is None:
                 if args.model_meta.is_multimodal:

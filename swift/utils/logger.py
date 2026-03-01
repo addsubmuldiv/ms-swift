@@ -2,10 +2,12 @@
 import importlib.util
 import logging
 import os
+import warnings
 from contextlib import contextmanager
-from modelscope.utils.logger import get_logger as get_ms_logger
 from types import MethodType
 from typing import Optional
+
+from modelscope.utils.logger import get_logger as get_ms_logger
 
 
 # Avoid circular reference
@@ -22,6 +24,29 @@ logger_format = logging.Formatter('[%(levelname)s:%(name)s] %(message)s')
 
 info_set = set()
 warning_set = set()
+
+
+class _TransformersVerboseWarningFilter(logging.Filter):
+    """Filter noisy transformers warnings that print huge parameter name lists."""
+
+    _patterns = (
+        'were not used when initializing',
+        'were not initialized from the model checkpoint',
+        'The tokenizer has new PAD/BOS/EOS tokens that differ from the model config and generation config.',
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if any(pattern in msg for pattern in self._patterns):
+            swift_logger = logging.getLogger(__name__.split('.')[0])
+            warning_once_func = getattr(swift_logger, 'warning_once', None)
+            if callable(warning_once_func):
+                warning_once_func(
+                    '已抑制 transformers 的超长参数/Tokenizer 对齐告警，避免终端卡顿。'
+                    '如需完整明细，设置 SWIFT_VERBOSE_LOADING_WARNINGS=1。',
+                    hash_id='suppress_transformers_verbose_loading_warnings')
+            return False
+        return True
 
 
 def info_if(self, msg, cond, *args, **kwargs):
@@ -154,3 +179,34 @@ def add_file_handler_if_needed(logger, log_file, file_mode, log_level):
         file_handler.setFormatter(logger_format)
         file_handler.setLevel(log_level)
         logger.addHandler(file_handler)
+
+
+def _install_transformers_warning_filter():
+    if os.getenv('SWIFT_VERBOSE_LOADING_WARNINGS', '0') in {'1', 'true', 'True'}:
+        return
+    warning_filter = _TransformersVerboseWarningFilter()
+    for logger_name in ('transformers.modeling_utils', 'transformers.trainer'):
+        tf_logger = logging.getLogger(logger_name)
+        if any(isinstance(f, _TransformersVerboseWarningFilter) for f in tf_logger.filters):
+            continue
+        tf_logger.addFilter(warning_filter)
+
+
+def _install_python_warning_filter():
+    """Filter noisy warning.warn outputs that include huge parameter name lists."""
+    if os.getenv('SWIFT_VERBOSE_LOADING_WARNINGS', '0') in {'1', 'true', 'True'}:
+        return
+
+    # transformers/modelscope/peft often emit massive key lists via warnings.warn.
+    warning_patterns = (
+        r'Some weights of the model checkpoint at .* were not used when initializing .*',
+        r'Some weights of .* were not initialized from the model checkpoint at .* and are newly initialized: .*',
+        r'Some weights of .* were not initialized from the model checkpoint and are being ignored because you passed '
+        r'`ignore_mismatched_sizes=True`: .*',
+    )
+    for pattern in warning_patterns:
+        warnings.filterwarnings('ignore', message=pattern)
+
+
+_install_transformers_warning_filter()
+_install_python_warning_filter()

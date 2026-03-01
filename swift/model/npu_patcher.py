@@ -1,18 +1,102 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
+import importlib
+from functools import wraps
+from typing import Any, Iterable, Optional
 
 import accelerate.utils.fsdp_utils as fsdp_utils
 import torch
 import torch.nn.functional as F
 import torch_npu
 from accelerate.accelerator import Accelerator
-from functools import wraps
 from torch import nn
 from transformers.models.qwen2 import modeling_qwen2
 from transformers.models.qwen3 import modeling_qwen3
 from transformers.models.qwen3_moe import modeling_qwen3_moe
+from transformers.models.qwen3_next import modeling_qwen3_next
 from transformers.models.qwen3_vl_moe import modeling_qwen3_vl_moe
-from typing import Any
+
+
+def _build_fqns_prefix_set(filter_fqns: Iterable[str]) -> set[str]:
+    """Convert FQNs to a fast lookup set of module prefixes (with trailing '.')."""
+    prefix_set: set[str] = set()
+    for fqn in filter_fqns:
+        if not isinstance(fqn, str) or '.' not in fqn:
+            continue
+        pos = 0
+        while True:
+            dot_idx = fqn.find('.', pos)
+            if dot_idx < 0:
+                break
+            prefix_set.add(fqn[:dot_idx + 1])
+            pos = dot_idx + 1
+    return prefix_set
+
+
+def _patch_fsdp_apply_to_modules() -> None:
+    """
+    Speed up FSDP1 lazy-init traversal on huge MoE models.
+
+    Original torch implementation scans `filter_fqns` linearly for every child
+    module (`for fqn in filter_fqns: if fqn.startswith(new_prefix)`), which is
+    very expensive when `filter_fqns` is large. We precompute a prefix set and
+    replace linear scan with O(1) membership test.
+    """
+    try:
+        from torch.distributed.fsdp import _common_utils as fsdp_common_utils
+    except Exception:
+        return
+
+    original_apply = fsdp_common_utils._apply_to_modules
+    if getattr(original_apply, '_swift_fsdp_apply_optimized', False):
+        return
+
+    @wraps(original_apply)
+    def optimized_apply_to_modules(
+        root_module: torch.nn.Module,
+        module_fn,
+        return_fn,
+        filter_fqns: Optional[list[str]] = None,
+        *args,
+        **kwargs,
+    ):
+        prefix_set: Optional[set[str]] = None
+        if filter_fqns is not None:
+            prefix_set = _build_fqns_prefix_set(filter_fqns)
+
+        def f(module: torch.nn.Module, prefix: str, tree_level: int, *inner_args, **inner_kwargs):
+            module_fn(module, prefix, tree_level, *inner_args, **inner_kwargs)
+            for submodule_name, submodule in module.named_children():
+                if submodule is None:
+                    continue
+                new_prefix = prefix + submodule_name + '.'
+                new_tree_level = tree_level + 1
+                if prefix_set is not None and new_prefix not in prefix_set:
+                    # Keep torch's compatibility behavior for wrapper names.
+                    if submodule_name in {'_fsdp_wrapped_module', '_dmp_wrapped_module', 'module'}:
+                        new_prefix = prefix
+                f(submodule, new_prefix, new_tree_level, *inner_args, **inner_kwargs)
+
+        f(root_module, '', 0, *args, **kwargs)
+        return return_fn(*args, **kwargs)
+
+    optimized_apply_to_modules._swift_fsdp_apply_optimized = True
+    fsdp_common_utils._apply_to_modules = optimized_apply_to_modules
+
+    # Some fsdp modules import `_apply_to_modules` by value; patch them too.
+    for module_name in (
+        'torch.distributed.fsdp._optim_utils',
+        'torch.distributed.fsdp._debug_utils',
+    ):
+        try:
+            target_module = importlib.import_module(module_name)
+            if getattr(target_module, '_apply_to_modules', None) is original_apply:
+                target_module._apply_to_modules = optimized_apply_to_modules
+        except Exception:
+            continue
+
+
+_patch_fsdp_apply_to_modules()
 
 
 class NPUCastError(RuntimeError):
@@ -110,12 +194,50 @@ class NpuRMSNorm(nn.Module):
         return f'{tuple(self.weight.shape)}, eps={self.variance_epsilon}'
 
 
+class NpuQwen3NextRMSNorm(nn.Module):
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        # Keep Qwen3Next initialization semantics: this weight is zero-centered and used as (1 + weight).
+        self.weight = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        norm_weight = (1.0 + self.weight).to(torch.float32)
+        output = torch_npu.npu_rms_norm(hidden_states.to(torch.float32), norm_weight, epsilon=self.eps)[0]
+        return output.to(input_dtype)
+
+    def extra_repr(self):
+        return f'{tuple(self.weight.shape)}, eps={self.eps}'
+
+
 def npu_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors."""
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
     k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
+    return q_embed, k_embed
+
+
+def npu_qwen3_next_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """
+    Qwen3Next uses partial rotary embedding: only the first rotary_dim is rotated.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    rotary_dim = cos.shape[-1]
+
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+    q_embed = torch_npu.npu_rotary_mul(q_rot.contiguous(), cos.contiguous(), sin.contiguous())
+    k_embed = torch_npu.npu_rotary_mul(k_rot.contiguous(), cos.contiguous(), sin.contiguous())
+
+    if q_pass.shape[-1] > 0:
+        q_embed = torch.cat([q_embed, q_pass], dim=-1)
+    if k_pass.shape[-1] > 0:
+        k_embed = torch.cat([k_embed, k_pass], dim=-1)
     return q_embed, k_embed
 
 
@@ -149,6 +271,12 @@ class NpuGmmFunction(torch.autograd.Function):
             dw = torch.stack([torch.matmul(xt_list[i], grad_outputs_list[i]) for i in range(len(xt_list))])
 
         return dx[0], dw, None, None
+
+
+def _group_list_to_split_size(group_list: torch.Tensor) -> list[int]:
+    cpu_group_list = group_list.to('cpu', non_blocking=False)
+    cpu_group_list = [0] + cpu_group_list.tolist()
+    return [cpu_group_list[i + 1] - cpu_group_list[i] for i in range(len(cpu_group_list) - 1)]
 
 
 def npu_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -187,9 +315,7 @@ def npu_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     tokens_per_experts = torch.sum(expert_mask, dim=(1, 2))
     group_list = torch.cumsum(tokens_per_experts, dim=0)
 
-    cpu_group_list = group_list.to('cpu', non_blocking=False)
-    cpu_group_list = [0] + cpu_group_list.tolist()
-    split_size = [cpu_group_list[i + 1] - cpu_group_list[i] for i in range(len(cpu_group_list) - 1)]
+    split_size = _group_list_to_split_size(group_list)
 
     up_res = NpuGmmFunction.apply(permuted_tokens, w1, group_list, split_size)
     gate_res = NpuGmmFunction.apply(permuted_tokens, w2, group_list, split_size)
@@ -210,6 +336,66 @@ def npu_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     unpermuted_tokens = unpermuted_tokens.reshape(-1, topk, permuted_tokens.size(-1))
     unpermuted_tokens = unpermuted_tokens * probs.unsqueeze(-1)
     final_hidden_states = unpermuted_tokens.sum(dim=1).to(hidden_states.dtype)
+    final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+    return final_hidden_states, router_logits
+
+
+def npu_qwen3_next_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    max_experts_per_chunk = 128
+    batch_size, sequence_length, hidden_dim = hidden_states.shape
+    hidden_states = hidden_states.view(-1, hidden_dim)
+    router_logits = self.gate(hidden_states)
+
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+    if self.norm_topk_prob:
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    routing_weights = routing_weights.to(hidden_states.dtype)
+
+    input_dtype = hidden_states.dtype
+    up_weight_list = [e.up_proj.weight.t().to(input_dtype) for e in self.experts]
+    gate_weight_list = [e.gate_proj.weight.t().to(input_dtype) for e in self.experts]
+    down_weight_list = [e.down_proj.weight.t().to(input_dtype) for e in self.experts]
+
+    final_hidden_states = torch.zeros_like(hidden_states)
+
+    for expert_start in range(0, self.num_experts, max_experts_per_chunk):
+        expert_end = min(expert_start + max_experts_per_chunk, self.num_experts)
+        chunk_size = expert_end - expert_start
+        chunk_mask = (selected_experts >= expert_start) & (selected_experts < expert_end)
+        if not chunk_mask.any().item():
+            continue
+
+        token_idx, topk_idx = torch.where(chunk_mask)
+        chunk_expert_idx = selected_experts[token_idx, topk_idx] - expert_start
+        sorted_idx = torch.sort(chunk_expert_idx.float(), stable=True)[1]
+        sorted_token_idx = token_idx.index_select(0, sorted_idx)
+        sorted_topk_idx = topk_idx.index_select(0, sorted_idx)
+        sorted_chunk_expert_idx = chunk_expert_idx.index_select(0, sorted_idx)
+
+        permuted_tokens = hidden_states.index_select(0, sorted_token_idx)
+        tokens_per_experts = torch.zeros(chunk_size, dtype=torch.int64, device=hidden_states.device)
+        tokens_per_experts.scatter_add_(
+            0, sorted_chunk_expert_idx, torch.ones_like(sorted_chunk_expert_idx, dtype=torch.int64))
+        group_list = torch.cumsum(tokens_per_experts, dim=0)
+        split_size = _group_list_to_split_size(group_list)
+
+        w1 = torch.stack(up_weight_list[expert_start:expert_end])
+        w2 = torch.stack(gate_weight_list[expert_start:expert_end])
+        w3 = torch.stack(down_weight_list[expert_start:expert_end])
+
+        up_res = NpuGmmFunction.apply(permuted_tokens, w1, group_list, split_size)
+        gate_res = NpuGmmFunction.apply(permuted_tokens, w2, group_list, split_size)
+        act_res = torch_npu.npu_swiglu(torch.cat([gate_res, up_res], dim=-1))
+        down_res = NpuGmmFunction.apply(act_res, w3, group_list, split_size)
+
+        weighted_down_res = down_res * routing_weights[sorted_token_idx, sorted_topk_idx, None]
+        final_hidden_states.index_add_(0, sorted_token_idx, weighted_down_res.to(hidden_states.dtype))
+
+    shared_expert_output = self.shared_expert(hidden_states)
+    shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+    final_hidden_states = final_hidden_states + shared_expert_output
     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
     return final_hidden_states, router_logits
@@ -321,6 +507,15 @@ _PATCH_TABLE: tuple[tuple[Any, dict[str, Any]], ...] = (
             'Qwen3MoeRMSNorm': NpuRMSNorm,
             'apply_rotary_pos_emb': npu_apply_rotary_pos_emb,
             'Qwen3MoeSparseMoeBlock.forward': npu_moe_block_forward,
+        },
+    ),
+    (
+        modeling_qwen3_next,
+        {
+            'Qwen3NextRMSNorm': NpuQwen3NextRMSNorm,
+            'apply_rotary_pos_emb': npu_qwen3_next_apply_rotary_pos_emb,
+            'Qwen3NextMLP.forward': npu_swiglu_forward,
+            'Qwen3NextSparseMoeBlock.forward': npu_qwen3_next_moe_block_forward,
         },
     ),
     (

@@ -208,7 +208,12 @@ class SwiftMixin:
         return use_logits_to_keep
 
     def _save_initial_model(self, output_dir):
-        # pissa/olora/lora-ga
+        # Only needed for pissa/olora/lora-ga. For common LoRA init modes, skip
+        # expensive unwrap/model traversal at startup.
+        init_weights = getattr(self.args, 'init_weights', None)
+        if not (isinstance(init_weights, str) and any(s in init_weights for s in ('pissa', 'olora', 'lora-ga'))):
+            return
+
         model = unwrap_model(self.model)
         if isinstance(model, PeftModel):
             config = model.peft_config.get('default')
@@ -220,7 +225,11 @@ class SwiftMixin:
                 config.init_lora_weights = init_lora_weights
 
     def _save_converted_model(self, output_dir):
-        # pissa/olora/lora-ga
+        # Only needed for pissa/olora/lora-ga checkpoints.
+        init_weights = getattr(self.args, 'init_weights', None)
+        if not (isinstance(init_weights, str) and any(s in init_weights for s in ('pissa', 'olora', 'lora-ga'))):
+            return
+
         model = unwrap_model(self.model)
         if isinstance(model, PeftModel):
             config = model.peft_config.get('default')
