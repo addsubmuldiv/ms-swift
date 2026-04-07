@@ -11,9 +11,9 @@
 | software  | version         |
 | --------- | --------------- |
 | Python    | >= 3.10, < 3.12 |
-| CANN      | == 8.5.1        |
+| CANN      | == 9.0.0        |
 | torch     | == 2.7.1        |
-| torch_npu | == 2.7.1.post2  |
+| torch_npu | == 26.0.0       |
 
 
 基础环境准备请参照这份 [Ascend PyTorch 安装文档](https://gitcode.com/Ascend/pytorch)。
@@ -64,21 +64,29 @@ print(torch.randn(10, device='npu:0'))
 ```
 
 **如果需要使用 MindSpeed(Megatron-LM)，请按照下面引导安装必要依赖**
+
+当前 `ms-swift` 的 NPU Megatron 路径固定按 **MindSpeed `core_r0.15.3` + Megatron-LM `v0.15.3` + `transformer_engine`** 维护，不再推荐 `0.12.1` 组合，也不提供 `local` / `transformer_engine` 双栈切换。
+
+MindSpeed `core_r0.15.3` 相比旧栈新增了 `intra_dist_opt_instance` 通信域，显存会额外增加约 `2 * HCCL_BUFFSIZE`。如果升级后遇到 OOM，先从这里排查。
+
 ```shell
-# 1. 获取并切换 Megatron-LM 至 core_v0.12.1 版本
+# 1. 获取并切换 Megatron-LM 至 v0.15.3 版本
 git clone https://github.com/NVIDIA/Megatron-LM.git
 cd Megatron-LM
-git checkout core_v0.12.1
+git checkout v0.15.3
 cd ..
 
 # 2. 获取并安装 MindSpeed
 git clone https://gitcode.com/Ascend/MindSpeed.git
 cd MindSpeed
-git checkout 2.3.0_core_r0.12.1
+git checkout core_r0.15.3
 pip install -e .
 cd ..
 
-# 3. 设置环境变量
+# 3. 安装 mcore-bridge
+pip install git+https://github.com/modelscope/mcore-bridge.git
+
+# 4. 设置环境变量
 export PYTHONPATH=$PYTHONPATH:<your_local_megatron_lm_path>
 export MEGATRON_LM_PATH=<your_local_megatron_lm_path>
 ```
@@ -87,6 +95,8 @@ export MEGATRON_LM_PATH=<your_local_megatron_lm_path>
 ```shell
 python -c "import mindspeed.megatron_adaptor; from swift.megatron.init import init_megatron_env; init_megatron_env(); print('✓ NPU环境下的Megatron-SWIFT配置验证成功！')"
 ```
+
+如果版本不匹配，`init_megatron_env()` 会直接报错，提示当前环境与 `MindSpeed core_r0.15.3 + Megatron-LM v0.15.3` 预期不一致，而不是继续在错误栈上黑盒运行。
 
 ### 环境查看
 
@@ -154,6 +164,8 @@ Legend:
 ## 微调
 
 以下介绍LoRA的微调, 全参数微调设置参数`--tuner_type full`即可. **更多训练脚本**参考[这里](https://github.com/modelscope/ms-swift/tree/main/examples/ascend/train).
+
+如果走 MindSpeed Megatron 训练，建议显式设置 `--gradient_accumulation_fusion false`。NPU 上这条 fused wgrad 路径依赖 `main_grad` 预置，和当前 Megatron-SWIFT 训练链路的默认行为并不总是对齐，关闭后更稳。
 
 | 模型大小 | NPU数量 | deepspeed类型 | 最大显存占用量 |
 | -------- | ------- | ------------- | -------------- |

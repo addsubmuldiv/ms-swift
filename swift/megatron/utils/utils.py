@@ -17,6 +17,7 @@ from packaging import version
 from peft.tuners.lora import Linear as LoraLinear
 from peft.utils.other import ModulesToSaveWrapper
 from torch import nn
+from transformers.utils import is_torch_npu_available
 from typing import Optional, Tuple
 
 from swift.tuners import LoraConfig, Swift
@@ -26,6 +27,21 @@ from swift.utils import (activate_parameters, deep_getattr, find_layers, freeze_
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
 logger = get_logger()
+
+
+def _patch_mindspeed_te_lora_compat(model):
+    if not is_torch_npu_available():
+        return
+    for _, module in model.named_modules():
+        module_name = getattr(module.__class__, '__module__', '')
+        if not module_name.startswith('mindspeed.te.pytorch.module'):
+            continue
+        if hasattr(module, 'tp_group'):
+            continue
+        # MindSpeed 0.15.x 的部分 TE 线性层只暴露 `parallel_group`，但 LoRA 注入仍按
+        # Megatron TE 接口去读取 `tp_group`。这里在 ms-swift 适配层补齐别名，避免把
+        # 新 MindSpeed 的接口差异继续泄漏到训练入口。
+        setattr(module, 'tp_group', getattr(module, 'parallel_group', None))
 
 
 def find_all_linears(model, extra_layers=None):
@@ -145,6 +161,7 @@ def get_modules_to_save(args, model):
 
 
 def prepare_adapter(args, model):
+    _patch_mindspeed_te_lora_compat(model)
     target_modules = get_target_modules(args, model)
     modules_to_save = get_modules_to_save(args, model)
     lora_kwargs = {

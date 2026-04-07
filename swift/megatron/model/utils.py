@@ -35,8 +35,19 @@ def _check_padding_free(args, config):
         args.padding_free = False
 
 
+def _apply_npu_mcore_overrides(kwargs):
+    if not is_torch_npu_available():
+        return
+    # 0.15 及以上的 ModelConfig 才暴露 transformer_impl；0.12 没这个字段，不能强塞。
+    if 'transformer_impl' not in {f.name for f in fields(ModelConfig)}:
+        return
+    # 当前 NPU Megatron 路径只维护 TE 实现，避免 local/TE 双栈分叉。
+    kwargs['transformer_impl'] = 'transformer_engine'
+
+
 def get_mcore_model_config(args, hf_config):
     kwargs = hf_to_mcore_config(hf_config)
+    _apply_npu_mcore_overrides(kwargs)
     kwargs['mcore_model_type'] = args.megatron_model_meta.model_type
     kwargs['hf_config'] = hf_config
     for f in fields(ModelConfig):
