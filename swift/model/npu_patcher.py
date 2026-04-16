@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import accelerate.utils.fsdp_utils as fsdp_utils
+import importlib
 import os
 import torch
 import torch.nn.functional as F
@@ -20,7 +21,11 @@ from swift.utils.logger import get_logger
 logger = get_logger()
 
 _DEFAULT_NPU_HCCL_CONNECT_TIMEOUT = '600'
+_DEFAULT_QWEN_GATED_DELTA_FLA_CHUNK_SIZE = '32'
+_QWEN_GATED_DELTA_FLA_KERNEL_ENV = 'SWIFT_QWEN3_NEXT_USE_NPU_FLA_KERNELS'
+_FLA_GATED_DELTA_RULE_CHUNK_SIZE_ENV = 'FLA_GATED_DELTA_RULE_CHUNK_SIZE'
 _ORIGINAL_MINDSPEED_TE_CP_CLASS = None
+_QWEN_GATED_DELTA_FLA_PATCHED = False
 
 
 def _set_default_hccl_connect_timeout_for_npu() -> None:
@@ -32,6 +37,34 @@ def _set_default_hccl_connect_timeout_for_npu() -> None:
 
 
 _set_default_hccl_connect_timeout_for_npu()
+
+
+def _should_patch_qwen_gated_delta_fla_kernels() -> bool:
+    return os.getenv(_QWEN_GATED_DELTA_FLA_KERNEL_ENV, '0') == '1'
+
+
+def _set_default_qwen_gated_delta_fla_chunk_size_for_npu() -> None:
+    if not _should_patch_qwen_gated_delta_fla_kernels() or _FLA_GATED_DELTA_RULE_CHUNK_SIZE_ENV in os.environ:
+        return
+
+    os.environ[_FLA_GATED_DELTA_RULE_CHUNK_SIZE_ENV] = _DEFAULT_QWEN_GATED_DELTA_FLA_CHUNK_SIZE
+    logger.info(
+        'Set %s=%s by default for Qwen gated-delta NPU FLA kernels.',
+        _FLA_GATED_DELTA_RULE_CHUNK_SIZE_ENV,
+        _DEFAULT_QWEN_GATED_DELTA_FLA_CHUNK_SIZE,
+    )
+
+
+def _resolve_qwen_gated_delta_fla_chunk_size() -> int:
+    raw_chunk_size = os.getenv(_FLA_GATED_DELTA_RULE_CHUNK_SIZE_ENV, _DEFAULT_QWEN_GATED_DELTA_FLA_CHUNK_SIZE)
+    try:
+        chunk_size = int(raw_chunk_size)
+    except ValueError as exc:
+        raise ValueError(
+            f'{_FLA_GATED_DELTA_RULE_CHUNK_SIZE_ENV} must be one of [16, 32, 64], got {raw_chunk_size!r}.') from exc
+    if chunk_size not in {16, 32, 64}:
+        raise ValueError(f'{_FLA_GATED_DELTA_RULE_CHUNK_SIZE_ENV} must be one of [16, 32, 64], got {chunk_size}.')
+    return chunk_size
 
 
 def patch_mindspeed_te_cp_implementation(megatron_args: dict[str, Any]) -> None:
@@ -353,6 +386,525 @@ def _apply_patch_map(root: Any, patch_map: dict[str, Any]) -> None:
         _setattr_path(root, path, value)
 
 
+def patch_qwen_gated_delta_fla_implementation() -> None:
+    global _QWEN_GATED_DELTA_FLA_PATCHED
+
+    if _QWEN_GATED_DELTA_FLA_PATCHED or not _should_patch_qwen_gated_delta_fla_kernels():
+        return
+
+    _set_default_qwen_gated_delta_fla_chunk_size_for_npu()
+
+    try:
+        gated_delta_rule_pkg = importlib.import_module('fla.ops.gated_delta_rule')
+        chunk_mod = importlib.import_module('fla.ops.gated_delta_rule.chunk')
+        wy_fast_mod = importlib.import_module('fla.ops.gated_delta_rule.wy_fast')
+        chunk_delta_h_mod = importlib.import_module('fla.ops.common.chunk_delta_h')
+    except ImportError as e:
+        logger.warning(f'Failed to import Qwen gated-delta FLA modules for NPU patching: {e}')
+        return
+
+    target_model_specs = (
+        ('transformers.models.qwen3_next.modeling_qwen3_next', 'Qwen3-Next'),
+        ('transformers.models.qwen3_5.modeling_qwen3_5', 'Qwen3.5'),
+        ('transformers.models.qwen3_5_moe.modeling_qwen3_5_moe', 'Qwen3.5-MoE'),
+    )
+    target_model_modules = []
+    for module_name, model_name in target_model_specs:
+        try:
+            target_model_modules.append((importlib.import_module(module_name), model_name))
+        except ImportError as e:
+            logger.debug('Skip gated-delta NPU patch for %s because %s is unavailable: %s', model_name, module_name, e)
+
+    if not target_model_modules:
+        logger.warning('No Qwen gated-delta model modules are available for NPU FLA patching.')
+        return
+
+    def patched_chunk_gated_delta_rule_bwd_dhu(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        w: torch.Tensor,
+        do: torch.Tensor,
+        dv: torch.Tensor,
+        g: torch.Tensor | None = None,
+        gk: torch.Tensor | None = None,
+        h0: torch.Tensor | None = None,
+        dht: torch.Tensor | None = None,
+        scale: float | None = None,
+        cu_seqlens: torch.LongTensor | None = None,
+        chunk_size: int = 64,
+        chunk_indices: torch.LongTensor | None = None,
+        use_exp2: bool = False,
+        transpose_state_layout: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, T, H, K, V = *q.shape, do.shape[-1]
+        BT = chunk_size
+        assert K <= 256, 'current kernel does not support head dimension being larger than 256.'
+
+        if chunk_indices is None and cu_seqlens is not None:
+            chunk_indices = chunk_delta_h_mod.prepare_chunk_indices(cu_seqlens, chunk_size)
+        if cu_seqlens is None:
+            N, NT, chunk_offsets = B, chunk_delta_h_mod.triton.cdiv(T, BT), None
+        else:
+            N = len(cu_seqlens) - 1
+            NT = len(chunk_indices)
+            chunk_offsets = chunk_delta_h_mod.prepare_chunk_offsets(cu_seqlens, BT)
+
+        if transpose_state_layout:
+            dh = q.new_empty(B, NT, H, V, K)
+        else:
+            dh = q.new_empty(B, NT, H, K, V)
+        dh0 = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
+        dv2 = torch.empty_like(dv)
+
+        def grid(meta):
+            return (chunk_delta_h_mod.triton.cdiv(V, meta['BV']), N * H)
+
+        chunk_delta_h_mod.chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64[grid](
+            q=q,
+            k=k,
+            w=w,
+            g=g,
+            gk=gk,
+            dht=dht,
+            dh0=dh0,
+            do=do,
+            dh=dh,
+            dv=dv,
+            dv2=dv2,
+            cu_seqlens=cu_seqlens,
+            chunk_offsets=chunk_offsets,
+            scale=scale,
+            T=T,
+            H=H,
+            K=K,
+            V=V,
+            BT=BT,
+            USE_EXP2=use_exp2,
+            TRANSPOSE_STATE=transpose_state_layout,
+        )
+        return dh, dh0, dv2
+
+    def patched_prepare_wy_repr_bwd(
+        k: torch.Tensor,
+        v: torch.Tensor,
+        beta: torch.Tensor,
+        A: torch.Tensor,
+        dw: torch.Tensor,
+        du: torch.Tensor,
+        g: torch.Tensor = None,
+        cu_seqlens: torch.LongTensor | None = None,
+        chunk_indices: torch.LongTensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, T, H, K, V = *k.shape, v.shape[-1]
+        BT = A.shape[-1]
+        if chunk_indices is None and cu_seqlens is not None:
+            chunk_indices = wy_fast_mod.prepare_chunk_indices(cu_seqlens, BT)
+        NT = wy_fast_mod.triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+        CONST_TILING = 64 if wy_fast_mod.check_shared_mem() else 32
+        BK = min(max(wy_fast_mod.triton.next_power_of_2(K), 16), CONST_TILING)
+        BV = min(max(wy_fast_mod.triton.next_power_of_2(V), 16), CONST_TILING)
+
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        dg = torch.empty_like(g) if g is not None else None
+        db = torch.empty_like(beta)
+        wy_fast_mod.prepare_wy_repr_bwd_kernel[(NT, B * H)](
+            k=k,
+            v=v,
+            beta=beta,
+            g=g,
+            A=A,
+            dw=dw,
+            du=du,
+            dk=dk,
+            dv=dv,
+            db=db,
+            dg=dg,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=BK,
+            BV=BV,
+        )
+        return dk, dv, db, dg
+
+    def patched_chunk_gated_delta_rule_fwd(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        scale: float,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.LongTensor | None = None,
+        cp_context=None,
+        chunk_indices: torch.LongTensor | None = None,
+        transpose_state_layout: bool = False,
+        chunk_size: int = 64,
+    ):
+        g = chunk_mod.chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices)
+        A = chunk_mod.chunk_scaled_dot_kkt_fwd(
+            k=k,
+            g=g,
+            beta=beta,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            output_dtype=torch.float32,
+            chunk_indices=chunk_indices,
+        )
+        A = chunk_mod.solve_tril(
+            A=A,
+            cu_seqlens=cu_seqlens,
+            output_dtype=k.dtype,
+            chunk_indices=chunk_indices,
+        )
+        w, u = chunk_mod.recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+
+        if cp_context is not None:
+            initial_state = chunk_mod.chunk_gated_delta_rule_fwd_h_pre_process(
+                k=k,
+                w=w,
+                u=u,
+                g=g,
+                chunk_size=chunk_size,
+                cu_seqlens=cu_seqlens,
+                initial_state=initial_state,
+                context=cp_context,
+                transpose_state_layout=transpose_state_layout,
+            )
+
+        h, v_new, final_state = chunk_mod.chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            transpose_state_layout=transpose_state_layout,
+        )
+
+        if cp_context is not None:
+            initial_state = chunk_mod.compress_h0(initial_state, context=cp_context)
+
+        o = chunk_mod.chunk_fwd_o(
+            q=q,
+            k=k,
+            v=v_new,
+            h=h,
+            g=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            transpose_state_layout=transpose_state_layout,
+        )
+        return g, o, A, final_state, initial_state
+
+    def patched_chunk_gated_delta_rule_bwd(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        A: torch.Tensor,
+        scale: float,
+        initial_state: torch.Tensor,
+        do: torch.Tensor,
+        dht: torch.Tensor,
+        cu_seqlens: torch.LongTensor | None = None,
+        cp_context=None,
+        chunk_indices: torch.LongTensor | None = None,
+        transpose_state_layout: bool = False,
+    ):
+        chunk_size = A.shape[-1]
+        w, u = chunk_mod.recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+
+        if cp_context is not None:
+            initial_state = chunk_mod.expand_h0(initial_state, context=cp_context)
+
+        h, v_new, _ = chunk_mod.chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            transpose_state_layout=transpose_state_layout,
+        )
+        dv = chunk_mod.chunk_bwd_dv_local(
+            q=q,
+            k=k,
+            g=g,
+            do=do,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+        )
+
+        if cp_context is not None:
+            dht, initial_state = chunk_mod.chunk_gated_delta_rule_bwd_dhu_pre_process(
+                q=q,
+                k=k,
+                w=w,
+                do=do,
+                dv=dv,
+                g=g,
+                scale=scale,
+                chunk_size=chunk_size,
+                cu_seqlens=cu_seqlens,
+                dht=dht,
+                initial_state=initial_state,
+                context=cp_context,
+                transpose_state_layout=transpose_state_layout,
+            )
+
+        dh, dh0, dv = patched_chunk_gated_delta_rule_bwd_dhu(
+            q=q,
+            k=k,
+            w=w,
+            g=g,
+            h0=initial_state,
+            dht=dht,
+            do=do,
+            dv=dv,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            transpose_state_layout=transpose_state_layout,
+        )
+        dq, dk, dw, dg = chunk_mod.chunk_bwd_dqkwg(
+            q=q,
+            k=k,
+            v=v_new,
+            w=w,
+            g=g,
+            h=h,
+            dv=dv,
+            do=do,
+            dh=dh,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            chunk_indices=chunk_indices,
+            transpose_state_layout=transpose_state_layout,
+        )
+        dk2, dv, db, dg2 = patched_prepare_wy_repr_bwd(
+            k=k,
+            v=v,
+            beta=beta,
+            g=g,
+            A=A,
+            dw=dw,
+            du=dv,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+        dk.add_(dk2)
+        dg.add_(dg2)
+        dg = chunk_mod.chunk_local_cumsum(
+            dg,
+            chunk_size=chunk_size,
+            reverse=True,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+        return dq, dk, dv, db, dg, dh0
+
+    class PatchedChunkGatedDeltaRuleFunction(torch.autograd.Function):
+
+        @staticmethod
+        @chunk_mod.input_guard
+        @chunk_mod.autocast_custom_fwd
+        def forward(
+            ctx,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            g: torch.Tensor,
+            beta: torch.Tensor,
+            scale: float,
+            initial_state: torch.Tensor,
+            output_final_state: bool,
+            cu_seqlens: torch.LongTensor | None = None,
+            cu_seqlens_cpu: torch.LongTensor | None = None,
+            use_qk_l2norm_in_kernel: bool = False,
+            cp_context=None,
+            transpose_state_layout: bool = False,
+        ):
+            chunk_size = _resolve_qwen_gated_delta_fla_chunk_size()
+            q_rstd, k_rstd = None, None
+            if use_qk_l2norm_in_kernel:
+                q, q_rstd = chunk_mod.l2norm_fwd(q)
+                k, k_rstd = chunk_mod.l2norm_fwd(k)
+
+            chunk_indices = chunk_mod.prepare_chunk_indices(
+                cu_seqlens,
+                chunk_size,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+            ) if cu_seqlens is not None else None
+            g, o, A, final_state, initial_state = patched_chunk_gated_delta_rule_fwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                cp_context=cp_context,
+                chunk_indices=chunk_indices,
+                transpose_state_layout=transpose_state_layout,
+                chunk_size=chunk_size,
+            )
+            ctx.save_for_backward(q, q_rstd, k, k_rstd, v, g, beta, A, initial_state, cu_seqlens, chunk_indices)
+            ctx.scale = scale
+            ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+            ctx.cp_context = cp_context
+            ctx.transpose_state_layout = transpose_state_layout
+            return o.to(q.dtype), final_state
+
+        @staticmethod
+        @chunk_mod.input_guard
+        @chunk_mod.autocast_custom_bwd
+        def backward(
+            ctx,
+            do: torch.Tensor,
+            dht: torch.Tensor,
+        ):
+            q, q_rstd, k, k_rstd, v, g, beta, A, initial_state, cu_seqlens, chunk_indices = ctx.saved_tensors
+            dq, dk, dv, db, dg, dh0 = patched_chunk_gated_delta_rule_bwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A=A,
+                scale=ctx.scale,
+                initial_state=initial_state,
+                do=do,
+                dht=dht,
+                cu_seqlens=cu_seqlens,
+                cp_context=ctx.cp_context,
+                chunk_indices=chunk_indices,
+                transpose_state_layout=ctx.transpose_state_layout,
+            )
+            if ctx.use_qk_l2norm_in_kernel:
+                dq = chunk_mod.l2norm_bwd(q, q_rstd, dq)
+                dk = chunk_mod.l2norm_bwd(k, k_rstd, dk)
+            return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, dh0, None, None, None, None, None, None
+
+    @torch.compiler.disable
+    def patched_chunk_gated_delta_rule(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        scale: float = None,
+        initial_state: torch.Tensor = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        cu_seqlens: torch.LongTensor | None = None,
+        cu_seqlens_cpu: torch.LongTensor | None = None,
+        cp_context=None,
+        transpose_state_layout: bool = False,
+        **kwargs,
+    ):
+        if 'head_first' in kwargs:
+            chunk_mod.warnings.warn(
+                'head_first is deprecated and will be removed in a future version. '
+                'Please use head_first=False for now instead.',
+            )
+
+        if cp_context is not None:
+            assert initial_state is None, 'Initial state is not supported for CP'
+            assert output_final_state is False, 'Output final state is not supported for CP'
+            assert cp_context.cu_seqlens is not None, 'cu_seqlens is required for CP'
+            cu_seqlens = cp_context.cu_seqlens
+            if cp_context.cu_seqlens_cpu is not None:
+                cu_seqlens_cpu = cp_context.cu_seqlens_cpu
+
+        if cu_seqlens is not None:
+            if q.shape[0] != 1:
+                raise ValueError(
+                    f'The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`.'
+                    f'Please flatten variable-length inputs before processing.',
+                )
+            if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
+                raise ValueError(
+                    'The number of initial states is expected to be equal to the number of input sequences, '
+                    f'i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.',
+                )
+        if scale is None:
+            scale = k.shape[-1] ** -0.5
+        o, final_state = PatchedChunkGatedDeltaRuleFunction.apply(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            output_final_state,
+            cu_seqlens,
+            cu_seqlens_cpu,
+            use_qk_l2norm_in_kernel,
+            cp_context,
+            transpose_state_layout,
+        )
+        return o, final_state
+
+    chunk_delta_h_mod.chunk_gated_delta_rule_bwd_dhu = patched_chunk_gated_delta_rule_bwd_dhu
+    wy_fast_mod.prepare_wy_repr_bwd = patched_prepare_wy_repr_bwd
+    chunk_mod.prepare_wy_repr_bwd = patched_prepare_wy_repr_bwd
+    chunk_mod.chunk_gated_delta_rule_fwd = patched_chunk_gated_delta_rule_fwd
+    chunk_mod.chunk_gated_delta_rule_bwd = patched_chunk_gated_delta_rule_bwd
+    chunk_mod.ChunkGatedDeltaRuleFunction = PatchedChunkGatedDeltaRuleFunction
+    chunk_mod.chunk_gated_delta_rule = patched_chunk_gated_delta_rule
+    gated_delta_rule_pkg.chunk_gated_delta_rule = patched_chunk_gated_delta_rule
+    patched_model_names = []
+    for model_mod, model_name in target_model_modules:
+        model_mod.chunk_gated_delta_rule = patched_chunk_gated_delta_rule
+        patched_model_names.append(model_name)
+
+    _QWEN_GATED_DELTA_FLA_PATCHED = True
+    logger.info(
+        'Patched Qwen gated-delta FLA chunk_size=%s for %s in npu_patcher.',
+        _resolve_qwen_gated_delta_fla_chunk_size(),
+        ', '.join(patched_model_names),
+    )
+
+
 _PATCH_TABLE: tuple[tuple[Any, dict[str, Any]], ...] = (
     (
         modeling_qwen2,
@@ -391,3 +943,5 @@ _PATCH_TABLE: tuple[tuple[Any, dict[str, Any]], ...] = (
 
 for _module, _patch_map in _PATCH_TABLE:
     _apply_patch_map(_module, _patch_map)
+
+patch_qwen_gated_delta_fla_implementation()
