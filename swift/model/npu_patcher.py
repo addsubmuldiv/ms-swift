@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import accelerate.utils.fsdp_utils as fsdp_utils
+import builtins
+import importlib
+import inspect
 import os
 import torch
 import torch.nn.functional as F
@@ -21,6 +24,323 @@ logger = get_logger()
 
 _DEFAULT_NPU_HCCL_CONNECT_TIMEOUT = '600'
 _ORIGINAL_MINDSPEED_TE_CP_CLASS = None
+_SUPPRESS_TRITON_TUNE_WARNING_ENV = 'SWIFT_SUPPRESS_TRITON_TUNE_WARNING'
+_TRITON_TUNE_WARNING_PREFIX = '[WARNING] Please DO NOT tune args '
+_QWEN3_NEXT_LINEAR_ATTENTION_PACKING_PATCHED = False
+
+
+def _is_env_enabled(env_name: str) -> bool:
+    return os.getenv(env_name, '0').lower() not in {'', '0', 'false', 'off'}
+
+
+def _derive_cu_seqlens(position_ids: torch.Tensor | None) -> torch.Tensor | None:
+    if position_ids is None or position_ids.ndim != 2 or position_ids.shape[0] != 1:
+        return None
+    flat_position_ids = position_ids[0]
+    seq_starts = torch.nonzero(flat_position_ids == 0, as_tuple=False).flatten().to(dtype=torch.long)
+    if seq_starts.numel() == 0:
+        return None
+    if seq_starts[0].item() != 0:
+        seq_starts = torch.cat([seq_starts.new_zeros(1), seq_starts], dim=0)
+    seq_end = seq_starts.new_tensor([flat_position_ids.shape[0]])
+    return torch.cat([seq_starts, seq_end], dim=0)
+
+
+def _function_accepts_argument(fn, arg_name: str) -> bool:
+    try:
+        return arg_name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def patch_qwen3_next_linear_attention_packing() -> None:
+    global _QWEN3_NEXT_LINEAR_ATTENTION_PACKING_PATCHED
+    if _QWEN3_NEXT_LINEAR_ATTENTION_PACKING_PATCHED:
+        return
+
+    try:
+        model_mod = importlib.import_module('transformers.models.qwen3_next.modeling_qwen3_next')
+    except ImportError as e:
+        logger.warning(f'Failed to import Qwen3-Next modules for packing patching: {e}')
+        return
+
+    origin_decoder_forward = model_mod.Qwen3NextDecoderLayer.forward
+    origin_gated_delta_forward = model_mod.Qwen3NextGatedDeltaNet.forward
+    origin_torch_chunk_gated_delta_rule = model_mod.torch_chunk_gated_delta_rule
+
+    def patched_torch_chunk_gated_delta_rule(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        chunk_size=64,
+        initial_state=None,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=False,
+        cu_seqlens=None,
+    ):
+        if cu_seqlens is None:
+            return origin_torch_chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                chunk_size=chunk_size,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+
+        if query.shape[0] != 1:
+            raise ValueError(
+                f'The batch size is expected to be 1 rather than {query.shape[0]} when using `cu_seqlens`.'
+                'Please flatten variable-length inputs before processing.'
+            )
+
+        cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.long)
+        num_sequences = cu_seqlens.numel() - 1
+        if initial_state is not None and initial_state.shape[0] != num_sequences:
+            raise ValueError(
+                f'The number of initial states is expected to be equal to the number of input sequences, '
+                f'i.e., {num_sequences} rather than {initial_state.shape[0]}.'
+            )
+
+        outputs = []
+        final_states = []
+        for seq_idx in range(num_sequences):
+            start = int(cu_seqlens[seq_idx].item())
+            end = int(cu_seqlens[seq_idx + 1].item())
+            if end < start:
+                raise ValueError(f'Invalid cu_seqlens: start={start}, end={end}.')
+            seq_initial_state = None if initial_state is None else initial_state[seq_idx:seq_idx + 1]
+            seq_output, seq_final_state = origin_torch_chunk_gated_delta_rule(
+                query[:, start:end],
+                key[:, start:end],
+                value[:, start:end],
+                g[:, start:end],
+                beta[:, start:end],
+                chunk_size=chunk_size,
+                initial_state=seq_initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+            outputs.append(seq_output)
+            if output_final_state:
+                final_states.append(seq_final_state)
+
+        packed_output = torch.cat(outputs, dim=1) if outputs else value.new_empty(value.shape[0], 0, value.shape[-1])
+        final_state = torch.cat(final_states, dim=0) if output_final_state and final_states else None
+        return packed_output, final_state
+
+    def patched_gated_delta_forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_params=None,
+        attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+    ):
+        if cu_seqlens is None:
+            return origin_gated_delta_forward(
+                self,
+                hidden_states=hidden_states,
+                cache_params=cache_params,
+                attention_mask=attention_mask,
+            )
+
+        hidden_states = model_mod.apply_mask_to_padding_states(hidden_states, attention_mask)
+
+        batch_size, seq_len, _ = hidden_states.shape
+        use_precomputed_states = cache_params is not None and cache_params.has_previous_state(self.layer_idx) and seq_len == 1
+
+        if use_precomputed_states:
+            conv_state = cache_params.layers[self.layer_idx].conv_states
+            recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
+
+        projected_states_qkvz = self.in_proj_qkvz(hidden_states)
+        projected_states_ba = self.in_proj_ba(hidden_states)
+        query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba)
+        query, key, value = (x.reshape(x.shape[0], x.shape[1], -1) for x in (query, key, value))
+
+        mixed_qkv = torch.cat((query, key, value), dim=-1)
+        mixed_qkv = mixed_qkv.transpose(1, 2)
+
+        if use_precomputed_states:
+            mixed_qkv = self.causal_conv1d_update(
+                mixed_qkv,
+                conv_state,
+                self.conv1d.weight.squeeze(1),
+                self.conv1d.bias,
+                self.activation,
+            )
+        else:
+            if cache_params is not None:
+                conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+                conv_state = cache_params.update_conv_state(conv_state, self.layer_idx)
+            if self.causal_conv1d_fn is not None:
+                mixed_qkv = self.causal_conv1d_fn(
+                    x=mixed_qkv,
+                    weight=self.conv1d.weight.squeeze(1),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    seq_idx=None,
+                )
+            else:
+                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+
+        mixed_qkv = mixed_qkv.transpose(1, 2)
+        query, key, value = torch.split(
+            mixed_qkv,
+            [
+                self.key_dim,
+                self.key_dim,
+                self.value_dim,
+            ],
+            dim=-1,
+        )
+        query = query.reshape(query.shape[0], query.shape[1], -1, self.head_k_dim)
+        key = key.reshape(key.shape[0], key.shape[1], -1, self.head_k_dim)
+        value = value.reshape(value.shape[0], value.shape[1], -1, self.head_v_dim)
+
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        if self.num_v_heads // self.num_k_heads > 1:
+            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+
+        if not use_precomputed_states:
+            normalized_cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.long)
+            chunk_kwargs = {
+                'g': g,
+                'beta': beta,
+                'initial_state': None,
+                'output_final_state': cache_params is not None,
+                'use_qk_l2norm_in_kernel': True,
+                'cu_seqlens': normalized_cu_seqlens,
+            }
+            if _function_accepts_argument(self.chunk_gated_delta_rule, 'cu_seqlens_cpu'):
+                chunk_kwargs['cu_seqlens_cpu'] = normalized_cu_seqlens.cpu()
+            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(query, key, value, **chunk_kwargs)
+        else:
+            core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                output_final_state=cache_params is not None,
+                use_qk_l2norm_in_kernel=True,
+            )
+
+        if cache_params is not None:
+            cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
+
+        z_shape_og = z.shape
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z = z.reshape(-1, z.shape[-1])
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1)
+
+        output = self.out_proj(core_attn_out)
+        return output
+
+    def patched_decoder_forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values=None,
+        **kwargs,
+    ):
+        if self.layer_type != 'linear_attention':
+            return origin_decoder_forward(
+                self,
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                **kwargs,
+            )
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        cu_seqlens = kwargs.get('cu_seq_lens_q')
+        if cu_seqlens is None:
+            cu_seqlens = _derive_cu_seqlens(position_ids)
+        hidden_states = self.linear_attn(
+            hidden_states=hidden_states,
+            cache_params=past_key_values,
+            attention_mask=attention_mask,
+            cu_seqlens=cu_seqlens,
+        )
+
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        if isinstance(hidden_states, tuple):
+            hidden_states, _ = hidden_states
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+    model_mod.torch_chunk_gated_delta_rule = patched_torch_chunk_gated_delta_rule
+    model_mod.Qwen3NextGatedDeltaNet.forward = patched_gated_delta_forward
+    model_mod.Qwen3NextDecoderLayer.forward = patched_decoder_forward
+    _QWEN3_NEXT_LINEAR_ATTENTION_PACKING_PATCHED = True
+    logger.info('Patched Qwen3-Next linear attention to propagate packing `cu_seqlens` through native paths.')
+
+
+def patch_qwen3_next_mindspeed_gated_delta_rule() -> None:
+    patch_qwen3_next_linear_attention_packing()
+    try:
+        model_mod = importlib.import_module('transformers.models.qwen3_next.modeling_qwen3_next')
+        mindspeed_chunk_mod = importlib.import_module('swift.model.chunk_gated_delta_rule')
+    except ImportError as e:
+        logger.warning(f'Failed to import Qwen3-Next MindSpeed gated delta modules for NPU patching: {e}')
+        return
+    model_mod.chunk_gated_delta_rule = mindspeed_chunk_mod.chunk_gated_delta_rule
+    logger.info('Patched Qwen3-Next chunk_gated_delta_rule to swift.model.chunk_gated_delta_rule.chunk_gated_delta_rule.')
+
+
+patch_qwen3_next_linear_attention_packing()
+if _is_env_enabled('SWIFT_QWEN3_NEXT_USE_MINDSPEED_GATED_DELTA_RULE'):
+    patch_qwen3_next_mindspeed_gated_delta_rule()
+
+
+def suppress_triton_tune_warning() -> None:
+    if os.getenv(_SUPPRESS_TRITON_TUNE_WARNING_ENV, '0').lower() in {'', '0', 'false', 'off'}:
+        return
+
+    try:
+        jit_mod = importlib.import_module('triton.runtime.jit')
+    except ImportError as e:
+        logger.warning(f'Failed to import triton.runtime.jit for warning suppression: {e}')
+        return
+
+    origin_print = getattr(jit_mod, 'print', builtins.print)
+    if getattr(origin_print, '__name__', '') == '_swift_suppressed_triton_print':
+        return
+
+    def _swift_suppressed_triton_print(*args, **kwargs):
+        if args:
+            first_arg = args[0]
+            if isinstance(first_arg, str) and first_arg.startswith(_TRITON_TUNE_WARNING_PREFIX):
+                return
+        return origin_print(*args, **kwargs)
+
+    jit_mod.print = _swift_suppressed_triton_print
+    logger.info('Enabled Triton tune warning suppression for messages starting with `%s`.',
+                _TRITON_TUNE_WARNING_PREFIX)
+
+
+suppress_triton_tune_warning()
 
 
 def _set_default_hccl_connect_timeout_for_npu() -> None:
