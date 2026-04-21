@@ -13,9 +13,21 @@ from torch import nn
 from transformers.models.qwen2 import modeling_qwen2
 from transformers.models.qwen3 import modeling_qwen3
 from transformers.models.qwen3_moe import modeling_qwen3_moe
-from transformers.models.qwen3_next import modeling_qwen3_next
+
 from transformers.models.qwen3_vl_moe import modeling_qwen3_vl_moe
 
+
+def patch_qwen3_next_mindspeed_gated_delta_rule() -> None:
+    try:
+        model_mod = importlib.import_module('transformers.models.qwen3_next.modeling_qwen3_next')
+        mindspeed_chunk_mod = importlib.import_module('swift.model.chunk_gated_delta_rule')
+    except ImportError as e:
+        print(f'Failed to import Qwen3-Next MindSpeed gated delta modules for NPU patching: {e}')
+        return
+    model_mod.chunk_gated_delta_rule = mindspeed_chunk_mod.chunk_gated_delta_rule
+    print('Patched Qwen3-Next chunk_gated_delta_rule to swift.model.chunk_gated_delta_rule.chunk_gated_delta_rule.')
+
+patch_qwen3_next_mindspeed_gated_delta_rule()
 
 def _build_fqns_prefix_set(filter_fqns: Iterable[str]) -> set[str]:
     """Convert FQNs to a fast lookup set of module prefixes (with trailing '.')."""
@@ -483,7 +495,7 @@ def _apply_patch_map(root: Any, patch_map: dict[str, Any]) -> None:
     for path, value in patch_map.items():
         _setattr_path(root, path, value)
 
-
+from transformers.models.qwen3_next import modeling_qwen3_next
 _PATCH_TABLE: tuple[tuple[Any, dict[str, Any]], ...] = (
     (
         modeling_qwen2,
