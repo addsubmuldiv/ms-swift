@@ -36,6 +36,8 @@ def _check_padding_free(args, config):
 
 
 def get_mcore_model_config(args, hf_config):
+    if args.use_ascend_coc and not is_torch_npu_available():
+        raise ValueError('`use_ascend_coc` requires an Ascend NPU environment with MindSpeed COC support.')
     kwargs = hf_to_mcore_config(hf_config)
     kwargs['mcore_model_type'] = args.megatron_model_meta.model_type
     kwargs['hf_config'] = hf_config
@@ -70,6 +72,7 @@ def get_mcore_model_config(args, hf_config):
     if args.router_replay_mode != 'disabled':
         kwargs['moe_enable_routing_replay'] = True
     config = ModelConfig(**kwargs)
+    setattr(config, 'transformer_impl', args.transformer_impl)
     if is_torch_npu_available() and getattr(args, 'attention_backend', 'flash') != 'local':
         setattr(config, 'use_flash_attn', True)
     _check_attention_backend(args, config)
