@@ -48,6 +48,10 @@ class MegatronSft(SwiftSft):
                 args.use_flash_attn = True
                 megatron_args['use_flash_attn'] = True
             repatch(megatron_args)
+            if args.use_ascend_coc:
+                # MindSpeed COC backward reads Megatron-LM global args through get_args().
+                from megatron.training.global_vars import set_args
+                set_args(args)
         template_cls = args.template_meta.template_cls
         if args.model_meta.is_multimodal and template_cls and template_cls.use_model:
             kwargs = {'return_dummy_model': True}

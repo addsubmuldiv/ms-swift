@@ -218,6 +218,8 @@ def get_padding_to(args):
     padding_to = None
     if args.tensor_model_parallel_size > 1 and args.sequence_parallel:
         padding_to = args.tensor_model_parallel_size
+    if getattr(args, 'use_ascend_coc', False):
+        padding_to = (padding_to or 1) * args.coc_parallel_num
     if args.context_parallel_size > 1:
         padding_to = (padding_to or 1) * args.context_parallel_size
     origin_padding_to = padding_to

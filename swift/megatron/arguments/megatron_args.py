@@ -461,6 +461,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     ddp_timeout: int = 18000000
     ddp_backend: Literal['nccl', 'gloo'] = 'nccl'
     use_distributed_optimizer: bool = True
+    transformer_impl: Literal['local', 'transformer_engine'] = 'transformer_engine'
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     decoder_first_pipeline_num_layers: Optional[int] = None
@@ -482,6 +483,12 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     pipeline_model_parallel_layout: Optional[str] = None
     expert_model_parallel_size: int = 1
     expert_tensor_parallel_size: int = 1
+
+    # Ascend COC
+    use_ascend_coc: bool = False
+    coc_mode: int = -1
+    coc_parallel_num: int = 1
+    coc_fused_kernel: bool = False
 
     # 'wandb', 'swanlab', 'tensorboard'
     report_to: List[str] = field(default_factory=lambda: ['tensorboard'])
@@ -582,7 +589,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             with open(args_path, 'r', encoding='utf-8') as f:
                 old_args = json.load(f)
             keys = list(f.name for f in fields(MegatronTunerMixin))
-            keys += ['mcore_model', 'task_type', 'num_labels']
+            keys += ['mcore_model', 'task_type', 'num_labels', 'transformer_impl']
             for key in keys:
                 old_value = old_args.get(key)
                 if old_value is not None:
@@ -622,6 +629,17 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             require_version('mcore-bridge>=1.2.0.dev',
                             'Please install mcore-bridge>=1.2.0 to use `mtp_shared_weights`.')
 
+    def _init_ascend_coc(self):
+        if not self.use_ascend_coc:
+            return
+        if self.fp8_format is not None:
+            raise ValueError('`use_ascend_coc` is not compatible with fp8 training.')
+        if self.model_info.is_moe_model:
+            raise ValueError('`use_ascend_coc` is only supported for dense models in Megatron-SWIFT.')
+        if self.transformer_impl != 'local':
+            logger.info('Setting args.transformer_impl: local because `use_ascend_coc=True`.')
+            self.transformer_impl = 'local'
+
     def __post_init__(self):
         if self.tuner_type != 'full':
             require_version('peft>=0.15', 'Please install peft>=0.15 to use LoRA in Megatron-SWIFT.')
@@ -658,6 +676,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         self.model_type = self.model_info.model_type
         self.model_dir = self.model_info.model_dir
         self.is_multimodal = self.model_meta.is_multimodal
+        self._init_ascend_coc()
         self.megatron_model_meta = get_model_meta(self._get_mcore_model_type(self.model_meta))
         if self.megatron_model_meta is None:
             raise ValueError(f'Model: {self.model} is not supported.')
