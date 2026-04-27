@@ -22,7 +22,6 @@ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelpe
 from modelscope import check_local_model_is_latest
 from packaging import version
 from pathlib import Path
-from transformers.utils import is_torch_npu_available
 from typing import Callable, Dict, List, Optional
 
 from swift.dataset import RowPreprocessor
@@ -42,7 +41,8 @@ from swift.utils import (deep_getattr, gc_collect, get_current_device, get_last_
                          is_master, ms_logger_context)
 from .batch_sampler import MegatronPretrainingRandomSampler, MegatronPretrainingSampler
 from .utils import (TrainerState, build_streaming_dataloader, get_batch_on_this_cp_rank, get_batch_on_this_pp_rank,
-                    get_packed_seq_params)
+                    get_packed_seq_params, needs_npu_attention_mask_2d, prepare_npu_attention_mask,
+                    should_use_npu_generated_attention_mask)
 
 try:
     from megatron.core.optimizer import param_group_identifier_keys
@@ -67,6 +67,7 @@ class BaseMegatronTrainer(ABC):
 
         self.args = args
         self.template = template
+        self._needs_npu_attention_mask_2d = False
         self.prepare_model()
         # Sync template.padding_free after prepare_model(), because _check_padding_free
         # may override args.padding_free for certain models (e.g. DSA attention).
@@ -193,6 +194,7 @@ class BaseMegatronTrainer(ABC):
         self.config = self.unwrapped_models[0].config
         logger.info(f'model_config: {self.config}')
         self.bridge = self.config.bridge
+        self._needs_npu_attention_mask_2d = needs_npu_attention_mask_2d(self.unwrapped_models)
         self.peft_models = self._prepare_peft_model(self.unwrapped_models)
         self.wrapped_models = wrap_model(args, self.unwrapped_models)
 
@@ -962,10 +964,6 @@ class BaseMegatronTrainer(ABC):
     def forward_step(self, data_iterator, model):
         pass
 
-    def _should_use_npu_generated_attention_mask(self, args) -> bool:
-        return (is_torch_npu_available() and args.task_type == 'causal_lm' and not args.padding_free
-                and getattr(args, 'attention_backend', None) != 'local' and getattr(args, 'use_flash_attn', False))
-
     def _prepare_batch(self, data, vp_stage=None, num_samples=None):
         batch = get_batch_on_this_pp_rank(self.args, data, vp_stage=vp_stage)
         if num_samples is None:
@@ -974,10 +972,8 @@ class BaseMegatronTrainer(ABC):
         text_position_ids = batch.pop('text_position_ids', None)
         if text_position_ids is None:
             text_position_ids = batch.get('position_ids')
-        if self._should_use_npu_generated_attention_mask(args):
-            if 'attention_mask_2d' not in batch and batch.get('attention_mask') is not None:
-                batch['attention_mask_2d'] = (~batch['attention_mask']).sum(dim=(1, 2)) > 0
-            batch['attention_mask'] = None
+        if should_use_npu_generated_attention_mask(args):
+            prepare_npu_attention_mask(batch, needs_attention_mask_2d=self._needs_npu_attention_mask_2d)
         else:
             batch.pop('attention_mask_2d', None)
         if args.padding_free and text_position_ids is not None:
