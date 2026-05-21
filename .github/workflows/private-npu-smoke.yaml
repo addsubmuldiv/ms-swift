@@ -1,18 +1,28 @@
-name: private-npu-smoke
+name: private-npu-ci
 
 on:
   workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Which NPU CI mode to run"
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - full
   pull_request:
     paths:
       - "**/*.py"
       - ".github/workflows/private-npu-smoke.yaml"
 
 concurrency:
-  group: private-npu-smoke-${{ github.ref }}
+  group: private-npu-ci-${{ github.ref }}-${{ github.event.inputs.run_mode || 'smoke' }}
   cancel-in-progress: true
 
 jobs:
   npu-smoke:
+    if: ${{ github.event_name == 'pull_request' || github.event.inputs.run_mode == 'smoke' }}
     runs-on: [self-hosted]
     timeout-minutes: 120
 
@@ -43,3 +53,26 @@ jobs:
           set -e
           source /data/zyh/swift_ci/ci_env/ms-swift-npu.sh
           python tests/run.py --test_dir tests/general --suites test_model.py
+
+  npu-full:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_mode == 'full' }}
+    runs-on: [self-hosted]
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Run full NPU unittest
+        shell: bash
+        run: |
+          set -e
+          source /data/zyh/swift_ci/ci_env/ms-swift-npu.sh
+          export IMAGE_NAME=ascendai/cann
+          export IMAGE_VERSION=8.3.rc2-910b-ubuntu22.04-py3.11
+          export TEST_LEVEL=0
+          export MODELSCOPE_CACHE=/data/zyh/swift_ci/cache/modelscope
+          export CI_COMMAND='bash .dev_scripts/ci_container_test.sh python tests/run.py --parallel 2 --subprocess --run_config tests/run_config.yaml'
+          bash .dev_scripts/dockerci_npu.sh
