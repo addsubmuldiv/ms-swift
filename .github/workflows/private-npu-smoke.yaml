@@ -1,0 +1,46 @@
+name: private-npu-smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "**/*.py"
+      - ".github/workflows/private-npu-smoke.yaml"
+
+concurrency:
+  group: private-npu-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  npu-smoke:
+    runs-on: [self-hosted]
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          lfs: true
+
+      - name: Check environment
+        shell: bash
+        run: |
+          set -e
+          source /data/zyh/swift_ci/ci_env/ms-swift-npu.sh
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          set -e
+          source /data/zyh/swift_ci/ci_env/ms-swift-npu.sh
+          pip install -r requirements/tests.txt -i https://mirrors.aliyun.com/pypi/simple/
+          pip install -r requirements/framework.txt -U -i https://mirrors.aliyun.com/pypi/simple/
+          pip install "transformers<5.0" "peft<0.19" diffusers optimum
+
+      - name: Run smoke unittest
+        shell: bash
+        run: |
+          set -e
+          source /data/zyh/swift_ci/ci_env/ms-swift-npu.sh
+          python tests/run.py --test_dir tests/general --suites test_model.py
