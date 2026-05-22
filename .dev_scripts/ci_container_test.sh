@@ -8,9 +8,45 @@ print_npu_warning() {
     echo "======================================================================"
 }
 
-install_npu_runtime() {
+is_npu_runtime_matched() {
+    python - <<PY
+import importlib.util
+
+expected_torch = '$NPU_TORCH_VERSION'
+expected_torch_npu = '$NPU_TORCH_NPU_VERSION'
+
+try:
+    import torch
+except Exception:
+    raise SystemExit(1)
+
+if importlib.util.find_spec('torch_npu') is None:
+    raise SystemExit(1)
+
+try:
+    import torch_npu
+except Exception:
+    raise SystemExit(1)
+
+torch_version = torch.__version__.split('+', 1)[0]
+torch_npu_version = getattr(torch_npu, '__version__', '')
+if torch_version == expected_torch and torch_npu_version == expected_torch_npu:
+    raise SystemExit(0)
+
+print(f'WARNING: NPU runtime version mismatch: torch={torch.__version__}, torch_npu={torch_npu_version}; '
+      f'expected torch=={expected_torch}, torch_npu=={expected_torch_npu}')
+raise SystemExit(1)
+PY
+}
+
+ensure_npu_runtime() {
+    if is_npu_runtime_matched; then
+        echo "NPU runtime already matched: torch==$NPU_TORCH_VERSION torch_npu==$NPU_TORCH_NPU_VERSION"
+        return
+    fi
+
     echo "Installing NPU runtime: torch==$NPU_TORCH_VERSION torch_npu==$NPU_TORCH_NPU_VERSION"
-    if ! python -m pip install "torch==$NPU_TORCH_VERSION" "torch_npu==$NPU_TORCH_NPU_VERSION" -i "$NPU_PIP_INDEX"; then
+    if ! python -m pip install --force-reinstall "torch==$NPU_TORCH_VERSION" "torch_npu==$NPU_TORCH_NPU_VERSION" -i "$NPU_PIP_INDEX"; then
         echo "WARNING: Failed to install torch/torch_npu NPU runtime packages."
         print_npu_warning
     fi
@@ -102,11 +138,11 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     fi
 
     if [ "$SWIFT_CI_USE_NPU" == "True" ]; then
-        install_npu_runtime
+        ensure_npu_runtime
     fi
     pip install -r requirements/framework.txt -U -i https://mirrors.aliyun.com/pypi/simple/
     if [ "$SWIFT_CI_USE_NPU" == "True" ]; then
-        report_npu_runtime
+        ensure_npu_runtime
     fi
     pip install decord einops -U -i https://mirrors.aliyun.com/pypi/simple/
     pip uninstall autoawq -y
@@ -118,6 +154,10 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     # test with install
     pip install .
     pip install auto_gptq bitsandbytes deepspeed -U -i https://mirrors.aliyun.com/pypi/simple/
+    if [ "$SWIFT_CI_USE_NPU" == "True" ]; then
+        ensure_npu_runtime
+        report_npu_runtime
+    fi
 else
     echo "Running case in release image, run case directly!"
 fi
