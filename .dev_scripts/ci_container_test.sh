@@ -196,9 +196,9 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     fi
     pip install decord einops -U -i https://mirrors.aliyun.com/pypi/simple/
     pip uninstall autoawq -y
-    pip install optimum
-    pip install diffusers
-    pip install "transformers<5.0" "peft<0.19"
+    python -m pip install optimum -i https://mirrors.aliyun.com/pypi/simple/
+    python -m pip install diffusers -i https://mirrors.aliyun.com/pypi/simple/
+    python -m pip install "transformers<5.0" "peft<0.19" -i https://mirrors.aliyun.com/pypi/simple/
     # pip install autoawq -U --no-deps
 
     # test with install
@@ -218,6 +218,7 @@ else
 fi
 # remove torch_extensions folder to avoid ci hang.
 rm -rf ~/.cache/torch_extensions
+python -m pip install diffusers -i https://mirrors.aliyun.com/pypi/simple/
 if [ $# -eq 0 ]; then
     ci_command="python tests/run.py --subprocess"
 else
