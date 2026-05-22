@@ -198,7 +198,15 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     pip uninstall autoawq -y
     python -m pip install optimum -i https://mirrors.aliyun.com/pypi/simple/
     python -m pip install diffusers -i https://mirrors.aliyun.com/pypi/simple/
-    python -m pip install "transformers<5.0" "peft<0.19" -i https://mirrors.aliyun.com/pypi/simple/
+    python -m pip install "transformers>=4.57,<5.0" "peft<0.19" -i https://mirrors.aliyun.com/pypi/simple/
+    python - <<'PY'
+import transformers
+from transformers.models.qwen3 import modeling_qwen3
+from transformers.models.qwen3_moe import modeling_qwen3_moe
+from transformers.models.qwen3_vl_moe import modeling_qwen3_vl_moe
+
+print(f'transformers={transformers.__version__}')
+PY
     # pip install autoawq -U --no-deps
 
     # test with install
