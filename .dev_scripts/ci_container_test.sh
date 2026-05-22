@@ -1,11 +1,22 @@
 NPU_TORCH_VERSION=${NPU_TORCH_VERSION:-2.7.1}
 NPU_TORCH_NPU_VERSION=${NPU_TORCH_NPU_VERSION:-2.7.1.post2}
 NPU_PIP_INDEX=${NPU_PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple/}
+NPU_CONSTRAINT_FILE=${NPU_CONSTRAINT_FILE:-/tmp/ms_swift_npu_constraints.txt}
 
 print_npu_warning() {
     echo "======================================================================"
     echo "WARNING: NPU runtime is unavailable, tests will continue on CPU path"
     echo "======================================================================"
+}
+
+setup_npu_pip_constraints() {
+    cat >"$NPU_CONSTRAINT_FILE" <<EOF
+torch==$NPU_TORCH_VERSION
+torch_npu==$NPU_TORCH_NPU_VERSION
+EOF
+    export PIP_CONSTRAINT="$NPU_CONSTRAINT_FILE"
+    echo "Using NPU pip constraints: $PIP_CONSTRAINT"
+    cat "$PIP_CONSTRAINT"
 }
 
 is_npu_runtime_matched() {
@@ -56,6 +67,8 @@ report_npu_runtime() {
     echo "==================== NPU runtime report ===================="
     echo "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-}"
     echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+    echo "Installed torch/CUDA related pip packages:"
+    python -m pip freeze | grep -Ei '^(torch|torch-npu|torch_npu|cuda-|nvidia-)' || true
     if command -v npu-smi >/dev/null 2>&1; then
         npu-smi info || echo "WARNING: npu-smi info failed."
     else
@@ -116,6 +129,10 @@ PY
 }
 
 if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
+    if [ "$SWIFT_CI_USE_NPU" == "True" ]; then
+        setup_npu_pip_constraints
+    fi
+
     # pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
     pip install -r requirements/tests.txt -i https://mirrors.aliyun.com/pypi/simple/
     git config --global --add safe.directory /ms-swift
