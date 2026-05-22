@@ -14,6 +14,8 @@ setup_npu_pip_constraints() {
     cat >"$NPU_CONSTRAINT_FILE" <<EOF
 torch==$NPU_TORCH_VERSION
 torch_npu==$NPU_TORCH_NPU_VERSION
+transformers>=4.57,<5.0
+peft<0.19
 EOF
     if [ "$NPU_PIP_BLOCK_CUDA_DEPS" == "True" ]; then
         cat >>"$NPU_CONSTRAINT_FILE" <<'EOF'
