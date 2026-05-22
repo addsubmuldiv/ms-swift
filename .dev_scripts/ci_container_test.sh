@@ -2,6 +2,7 @@ NPU_TORCH_VERSION=${NPU_TORCH_VERSION:-2.7.1}
 NPU_TORCH_NPU_VERSION=${NPU_TORCH_NPU_VERSION:-2.7.1.post2}
 NPU_PIP_INDEX=${NPU_PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple/}
 NPU_CONSTRAINT_FILE=${NPU_CONSTRAINT_FILE:-/tmp/ms_swift_npu_constraints.txt}
+NPU_PIP_BLOCK_CUDA_DEPS=${NPU_PIP_BLOCK_CUDA_DEPS:-True}
 
 print_npu_warning() {
     echo "======================================================================"
@@ -14,6 +15,38 @@ setup_npu_pip_constraints() {
 torch==$NPU_TORCH_VERSION
 torch_npu==$NPU_TORCH_NPU_VERSION
 EOF
+    if [ "$NPU_PIP_BLOCK_CUDA_DEPS" == "True" ]; then
+        cat >>"$NPU_CONSTRAINT_FILE" <<'EOF'
+# NPU CI should not resolve CUDA runtime wheels. If a dependency starts requiring
+# these packages, fail in pip's resolver instead of downloading hundreds of MB.
+cuda-toolkit<0
+nvidia-cublas<0
+nvidia-cuda-runtime<0
+nvidia-cuda-nvrtc<0
+nvidia-cuda-cupti<0
+nvidia-cudnn<0
+nvidia-cufft<0
+nvidia-curand<0
+nvidia-cusolver<0
+nvidia-cusparse<0
+nvidia-nccl<0
+nvidia-nvjitlink<0
+nvidia-nvtx<0
+nvidia-cublas-cu12<0
+nvidia-cuda-runtime-cu12<0
+nvidia-cuda-nvrtc-cu12<0
+nvidia-cuda-cupti-cu12<0
+nvidia-cudnn-cu12<0
+nvidia-cufft-cu12<0
+nvidia-curand-cu12<0
+nvidia-cusolver-cu12<0
+nvidia-cusparse-cu12<0
+nvidia-cusparselt-cu12<0
+nvidia-nccl-cu12<0
+nvidia-nvjitlink-cu12<0
+nvidia-nvtx-cu12<0
+EOF
+    fi
     export PIP_CONSTRAINT="$NPU_CONSTRAINT_FILE"
     echo "Using NPU pip constraints: $PIP_CONSTRAINT"
     cat "$PIP_CONSTRAINT"
