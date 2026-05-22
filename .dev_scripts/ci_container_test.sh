@@ -125,6 +125,12 @@ except Exception as e:
     print('=' * 70)
     raise SystemExit(0)
 
+try:
+    import transformers
+    print(f"transformers={transformers.__version__}")
+except Exception as e:
+    print(f"WARNING: failed to import transformers: {e!r}")
+
 if importlib.util.find_spec('torch_npu') is None:
     print('WARNING: torch_npu is not installed.')
     print('=' * 70)
