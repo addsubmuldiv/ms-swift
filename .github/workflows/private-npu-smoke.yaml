@@ -34,6 +34,14 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Verify CI revision
+        shell: bash
+        run: |
+          set -e
+          echo "CI checkout commit: $(git rev-parse HEAD)"
+          git log --oneline -1
+          grep -n "PIP_CONSTRAINT" .github/workflows/private-npu-smoke.yaml
+
       - name: Check environment
         shell: bash
         run: |
@@ -131,6 +139,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
+
+      - name: Verify CI revision
+        shell: bash
+        run: |
+          set -e
+          echo "CI checkout commit: $(git rev-parse HEAD)"
+          git log --oneline -1
+          grep -n "setup_npu_pip_constraints" .dev_scripts/ci_container_test.sh
 
       - name: Run Docker CANN NPU unittest
         shell: bash
