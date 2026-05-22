@@ -14,8 +14,6 @@ setup_npu_pip_constraints() {
     cat >"$NPU_CONSTRAINT_FILE" <<EOF
 torch==$NPU_TORCH_VERSION
 torch_npu==$NPU_TORCH_NPU_VERSION
-transformers>=4.57,<5.0
-peft<0.19
 EOF
     if [ "$NPU_PIP_BLOCK_CUDA_DEPS" == "True" ]; then
         cat >>"$NPU_CONSTRAINT_FILE" <<'EOF'
@@ -198,17 +196,9 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     fi
     pip install decord einops -U -i https://mirrors.aliyun.com/pypi/simple/
     pip uninstall autoawq -y
-    python -m pip install optimum -i https://mirrors.aliyun.com/pypi/simple/
-    python -m pip install diffusers -i https://mirrors.aliyun.com/pypi/simple/
-    python -m pip install "transformers>=4.57,<5.0" "peft<0.19" -i https://mirrors.aliyun.com/pypi/simple/
-    python - <<'PY'
-import transformers
-from transformers.models.qwen3 import modeling_qwen3
-from transformers.models.qwen3_moe import modeling_qwen3_moe
-from transformers.models.qwen3_vl_moe import modeling_qwen3_vl_moe
-
-print(f'transformers={transformers.__version__}')
-PY
+    pip install optimum
+    pip install diffusers
+    pip install "transformers<5.0" "peft<0.19"
     # pip install autoawq -U --no-deps
 
     # test with install
