@@ -203,7 +203,12 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
 
     # test with install
     pip install .
-    pip install auto_gptq bitsandbytes deepspeed -U -i https://mirrors.aliyun.com/pypi/simple/
+    if [ "$SWIFT_CI_USE_NPU" == "True" ]; then
+        echo "NPU CI skips auto_gptq because it is a CUDA/GPTQ optional dependency."
+        pip install bitsandbytes deepspeed -U -i https://mirrors.aliyun.com/pypi/simple/
+    else
+        pip install auto_gptq bitsandbytes deepspeed -U -i https://mirrors.aliyun.com/pypi/simple/
+    fi
     if [ "$SWIFT_CI_USE_NPU" == "True" ]; then
         ensure_npu_runtime
         report_npu_runtime
