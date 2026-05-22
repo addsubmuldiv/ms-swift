@@ -3,6 +3,17 @@ NPU_TORCH_NPU_VERSION=${NPU_TORCH_NPU_VERSION:-2.7.1.post2}
 NPU_PIP_INDEX=${NPU_PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple/}
 NPU_CONSTRAINT_FILE=${NPU_CONSTRAINT_FILE:-/tmp/ms_swift_npu_constraints.txt}
 
+run_pip() {
+    if [ "$SWIFT_CI_PIP_NO_PROXY" == "True" ]; then
+        echo "Running pip without proxy: python -m pip $*" >&2
+        env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
+            -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
+            python -m pip "$@"
+    else
+        python -m pip "$@"
+    fi
+}
+
 print_npu_warning() {
     echo "======================================================================"
     echo "WARNING: NPU runtime is unavailable, tests will continue on CPU path"
@@ -57,7 +68,7 @@ ensure_npu_runtime() {
     fi
 
     echo "Installing NPU runtime: torch==$NPU_TORCH_VERSION torch_npu==$NPU_TORCH_NPU_VERSION"
-    if ! python -m pip install --force-reinstall "torch==$NPU_TORCH_VERSION" "torch_npu==$NPU_TORCH_NPU_VERSION" -i "$NPU_PIP_INDEX"; then
+    if ! run_pip install --force-reinstall "torch==$NPU_TORCH_VERSION" "torch_npu==$NPU_TORCH_NPU_VERSION" -i "$NPU_PIP_INDEX"; then
         echo "WARNING: Failed to install torch/torch_npu NPU runtime packages."
         print_npu_warning
     fi
@@ -68,7 +79,7 @@ report_npu_runtime() {
     echo "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-}"
     echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
     echo "Installed torch/CUDA related pip packages:"
-    python -m pip freeze | grep -Ei '^(torch|torch-npu|torch_npu|cuda-|nvidia-)' || true
+    run_pip freeze | grep -Ei '^(torch|torch-npu|torch_npu|cuda-|nvidia-)' || true
     if command -v npu-smi >/dev/null 2>&1; then
         npu-smi info || echo "WARNING: npu-smi info failed."
     else
@@ -134,7 +145,7 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     fi
 
     # pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
-    pip install -r requirements/tests.txt -i https://mirrors.aliyun.com/pypi/simple/
+    run_pip install -r requirements/tests.txt -i https://mirrors.aliyun.com/pypi/simple/
     git config --global --add safe.directory /ms-swift
     git config --global user.email tmp
     git config --global user.name tmp.com
@@ -157,20 +168,20 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
     if [ "$SWIFT_CI_USE_NPU" == "True" ]; then
         ensure_npu_runtime
     fi
-    pip install -r requirements/framework.txt -U -i https://mirrors.aliyun.com/pypi/simple/
+    run_pip install -r requirements/framework.txt -U -i https://mirrors.aliyun.com/pypi/simple/
     if [ "$SWIFT_CI_USE_NPU" == "True" ]; then
         ensure_npu_runtime
     fi
-    pip install decord einops -U -i https://mirrors.aliyun.com/pypi/simple/
-    pip uninstall autoawq -y
-    pip install optimum
-    pip install diffusers
-    pip install "transformers<5.0" "peft<0.19"
+    run_pip install decord einops -U -i https://mirrors.aliyun.com/pypi/simple/
+    run_pip uninstall autoawq -y
+    run_pip install optimum
+    run_pip install diffusers
+    run_pip install "transformers<5.0" "peft<0.19"
     # pip install autoawq -U --no-deps
 
     # test with install
-    pip install .
-    pip install auto_gptq bitsandbytes deepspeed -U -i https://mirrors.aliyun.com/pypi/simple/
+    run_pip install .
+    run_pip install auto_gptq bitsandbytes deepspeed -U -i https://mirrors.aliyun.com/pypi/simple/
     if [ "$SWIFT_CI_USE_NPU" == "True" ]; then
         ensure_npu_runtime
         report_npu_runtime

@@ -27,6 +27,8 @@ jobs:
     if: ${{ github.event_name == 'pull_request' || github.event.inputs.run_mode == 'smoke' }}
     runs-on: [self-hosted]
     timeout-minutes: 120
+    env:
+      SWIFT_CI_PIP_NO_PROXY: "True"
 
     steps:
       - name: Checkout
@@ -45,9 +47,14 @@ jobs:
         run: |
           set -e
           source /data/zyh/swift_ci/ci_env/ms-swift-npu.sh
-          pip install -r requirements/tests.txt -i https://mirrors.aliyun.com/pypi/simple/
-          pip install -r requirements/framework.txt -U -i https://mirrors.aliyun.com/pypi/simple/
-          pip install "transformers<5.0" "peft<0.19" diffusers optimum
+          pip_no_proxy() {
+            env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
+                -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
+                python -m pip "$@"
+          }
+          pip_no_proxy install -r requirements/tests.txt -i https://mirrors.aliyun.com/pypi/simple/
+          pip_no_proxy install -r requirements/framework.txt -U -i https://mirrors.aliyun.com/pypi/simple/
+          pip_no_proxy install "transformers<5.0" "peft<0.19" diffusers optimum
 
       - name: Run smoke unittest
         shell: bash
@@ -78,6 +85,8 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.run_mode == 'docker-smoke' || github.event.inputs.run_mode == 'docker-full') }}
     runs-on: [self-hosted]
     timeout-minutes: 240
+    env:
+      SWIFT_CI_PIP_NO_PROXY: "True"
     container:
       image: 'quay.io/ascend/cann:8.3.rc2-910b-ubuntu22.04-py3.11'
       options: >-
