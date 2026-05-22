@@ -38,6 +38,7 @@ jobs:
         shell: bash
         run: |
           set -e
+          git config --global --add safe.directory "${GITHUB_WORKSPACE:-$PWD}"
           echo "CI checkout commit: $(git rev-parse HEAD)"
           git log --oneline -1
           grep -n "PIP_CONSTRAINT" .github/workflows/private-npu-smoke.yaml
@@ -144,6 +145,7 @@ jobs:
         shell: bash
         run: |
           set -e
+          git config --global --add safe.directory "${GITHUB_WORKSPACE:-$PWD}"
           echo "CI checkout commit: $(git rev-parse HEAD)"
           git log --oneline -1
           grep -n "setup_npu_pip_constraints" .dev_scripts/ci_container_test.sh
