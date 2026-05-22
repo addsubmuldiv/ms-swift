@@ -101,9 +101,11 @@ if [ "$MODELSCOPE_SDK_DEBUG" == "True" ]; then
         fi
     fi
 
-    pip install -r requirements/framework.txt -U -i https://mirrors.aliyun.com/pypi/simple/
     if [ "$SWIFT_CI_USE_NPU" == "True" ]; then
         install_npu_runtime
+    fi
+    pip install -r requirements/framework.txt -U -i https://mirrors.aliyun.com/pypi/simple/
+    if [ "$SWIFT_CI_USE_NPU" == "True" ]; then
         report_npu_runtime
     fi
     pip install decord einops -U -i https://mirrors.aliyun.com/pypi/simple/
