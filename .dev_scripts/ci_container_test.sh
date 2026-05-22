@@ -1,5 +1,6 @@
 NPU_TORCH_VERSION=${NPU_TORCH_VERSION:-2.7.1}
 NPU_TORCH_NPU_VERSION=${NPU_TORCH_NPU_VERSION:-2.7.1.post2}
+NPU_MODELSCOPE_VERSION=${NPU_MODELSCOPE_VERSION:-1.37.0}
 NPU_PIP_INDEX=${NPU_PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple/}
 NPU_CONSTRAINT_FILE=${NPU_CONSTRAINT_FILE:-/tmp/ms_swift_npu_constraints.txt}
 NPU_PIP_BLOCK_CUDA_DEPS=${NPU_PIP_BLOCK_CUDA_DEPS:-True}
@@ -14,6 +15,7 @@ setup_npu_pip_constraints() {
     cat >"$NPU_CONSTRAINT_FILE" <<EOF
 torch==$NPU_TORCH_VERSION
 torch_npu==$NPU_TORCH_NPU_VERSION
+modelscope==$NPU_MODELSCOPE_VERSION
 EOF
     if [ "$NPU_PIP_BLOCK_CUDA_DEPS" == "True" ]; then
         cat >>"$NPU_CONSTRAINT_FILE" <<'EOF'
