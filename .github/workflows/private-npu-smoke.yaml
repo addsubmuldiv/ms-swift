@@ -1,0 +1,172 @@
+name: private-npu-ci
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Which NPU CI mode to run"
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - full
+          - docker-smoke
+          - docker-full
+  pull_request:
+    paths:
+      - "**/*.py"
+      - ".github/workflows/private-npu-smoke.yaml"
+
+concurrency:
+  group: private-npu-ci-${{ github.ref }}-${{ github.event.inputs.run_mode || 'smoke' }}
+  cancel-in-progress: true
+
+jobs:
+  npu-smoke:
+    if: ${{ github.event_name == 'pull_request' || github.event.inputs.run_mode == 'smoke' }}
+    runs-on: [self-hosted]
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Verify CI revision
+        shell: bash
+        run: |
+          set -e
+          git config --global --add safe.directory "${GITHUB_WORKSPACE:-$PWD}"
+          echo "CI checkout commit: $(git rev-parse HEAD)"
+          git log --oneline -1
+          grep -n "PIP_CONSTRAINT" .github/workflows/private-npu-smoke.yaml
+
+      - name: Check environment
+        shell: bash
+        run: |
+          set -e
+          source /data/zyh/swift_ci/ci_env/ms-swift-npu.sh
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          set -e
+          source /data/zyh/swift_ci/ci_env/ms-swift-npu.sh
+          export PIP_CONSTRAINT=/tmp/ms_swift_private_npu_constraints.txt
+          cat > "$PIP_CONSTRAINT" <<'EOF'
+          torch==2.7.1
+          torch_npu==2.7.1.post2
+          cuda-toolkit<0
+          nvidia-cublas<0
+          nvidia-cuda-runtime<0
+          nvidia-cuda-nvrtc<0
+          nvidia-cuda-cupti<0
+          nvidia-cudnn<0
+          nvidia-cufft<0
+          nvidia-curand<0
+          nvidia-cusolver<0
+          nvidia-cusparse<0
+          nvidia-nccl<0
+          nvidia-nvjitlink<0
+          nvidia-nvtx<0
+          nvidia-cublas-cu12<0
+          nvidia-cuda-runtime-cu12<0
+          nvidia-cuda-nvrtc-cu12<0
+          nvidia-cuda-cupti-cu12<0
+          nvidia-cudnn-cu12<0
+          nvidia-cufft-cu12<0
+          nvidia-curand-cu12<0
+          nvidia-cusolver-cu12<0
+          nvidia-cusparse-cu12<0
+          nvidia-cusparselt-cu12<0
+          nvidia-nccl-cu12<0
+          nvidia-nvjitlink-cu12<0
+          nvidia-nvtx-cu12<0
+          EOF
+          echo "Using NPU pip constraints: $PIP_CONSTRAINT"
+          cat "$PIP_CONSTRAINT"
+          pip install -r requirements/tests.txt -i https://mirrors.aliyun.com/pypi/simple/
+          pip install -r requirements/framework.txt -U -i https://mirrors.aliyun.com/pypi/simple/
+          pip install "transformers<5.0" "peft<0.19" diffusers optimum
+
+      - name: Run smoke unittest
+        shell: bash
+        run: |
+          set -e
+          source /data/zyh/swift_ci/ci_env/ms-swift-npu.sh
+          python tests/run.py --test_dir tests/general --suites test_model.py
+
+  npu-full:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_mode == 'full' }}
+    runs-on: [self-hosted]
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Run full NPU unittest
+        shell: bash
+        run: |
+          set -e
+          source /data/zyh/swift_ci/ci_env/ms-swift-npu.sh
+          python tests/run.py --parallel 2 --subprocess --run_config tests/run_config.yaml
+
+  npu-docker-cann:
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.run_mode == 'docker-smoke' || github.event.inputs.run_mode == 'docker-full') }}
+    runs-on: [self-hosted]
+    timeout-minutes: 240
+    container:
+      image: 'quay.io/ascend/cann:8.3.rc2-910b-ubuntu22.04-py3.11'
+      options: >-
+        --privileged
+        --device=/dev/davinci0
+        --device=/dev/davinci1
+        --device=/dev/davinci2
+        --device=/dev/davinci3
+        --device=/dev/davinci_manager
+        --device=/dev/devmm_svm
+        --device=/dev/hisi_hdc
+        --volume=/usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+        --volume=/usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi:ro
+        --volume=/etc/ascend_install.info:/etc/ascend_install.info:ro
+        --volume=/data/zyh/swift_ci/cache/modelscope:/modelscope_cache
+        --volume=/data/zyh/swift_ci/cache/huggingface:/huggingface_cache
+        --volume=/data/zyh/swift_ci/cache/pip:/pip_cache
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Verify CI revision
+        shell: bash
+        run: |
+          set -e
+          git config --global --add safe.directory "${GITHUB_WORKSPACE:-$PWD}"
+          echo "CI checkout commit: $(git rev-parse HEAD)"
+          git log --oneline -1
+          grep -n "setup_npu_pip_constraints" .dev_scripts/ci_container_test.sh
+
+      - name: Run Docker CANN NPU unittest
+        shell: bash
+        run: |
+          set -e
+          export TEST_LEVEL=0
+          export MODELSCOPE_CACHE=/modelscope_cache
+          export HF_HOME=/huggingface_cache
+          export PIP_CACHE_DIR=/pip_cache
+          echo "MODELSCOPE_CACHE=${MODELSCOPE_CACHE}"
+          echo "HF_HOME=${HF_HOME}"
+          echo "PIP_CACHE_DIR=${PIP_CACHE_DIR}"
+          if [ "${{ github.event.inputs.run_mode }}" = "docker-smoke" ]; then
+            export CI_COMMAND='bash .dev_scripts/ci_container_test.sh python tests/run.py --test_dir tests/general --suites test_model.py'
+          else
+            export CI_COMMAND='bash .dev_scripts/ci_container_test.sh python tests/run.py --parallel 2 --subprocess --run_config tests/run_config.yaml'
+          fi
+          bash .dev_scripts/dockerci_npu.sh
