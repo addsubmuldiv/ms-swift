@@ -661,7 +661,10 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             with open(args_path, 'r', encoding='utf-8') as f:
                 old_args = json.load(f)
             keys = list(f.name for f in fields(MegatronTunerMixin))
-            keys += ['mcore_model', 'task_type', 'num_labels', 'transformer_impl']
+            keys += [
+                'mcore_model', 'task_type', 'num_labels', 'transformer_impl', 'use_ascend_coc', 'coc_mode',
+                'coc_parallel_num', 'coc_fused_kernel'
+            ]
             for key in keys:
                 old_value = old_args.get(key)
                 if old_value is not None:
