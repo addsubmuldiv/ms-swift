@@ -707,7 +707,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         if self.model_info.is_moe_model:
             raise ValueError('`use_ascend_coc` is only supported for dense models in Megatron-SWIFT.')
         if self.transformer_impl != 'local':
-            logger.info('Setting args.transformer_impl: local because `use_ascend_coc=True`.')
+            logger.info('Setting args.transformer_impl: local for MindSpeed COC patch registration.')
             self.transformer_impl = 'local'
 
     def __post_init__(self):
