@@ -243,10 +243,10 @@ def npu_apply_rotary_pos_emb_qwen3_5(q, k, cos, sin, position_ids=None, unsqueez
     return q_embed, k_embed
 
 
-def _patch_transformers_flash_linear_attention_available(available: bool) -> None:
+def _patch_transformers_flash_linear_attention_available() -> None:
 
     def _is_flash_linear_attention_available() -> bool:
-        return available
+        return True
 
     transformers_utils = import_optional_module('transformers.utils')
     if transformers_utils is not None:
@@ -513,10 +513,10 @@ def apply_patch() -> None:
         ('qwen3_vl_moe', modeling_qwen3_vl_moe, QWEN3_VL_MOE_PATCHES, {}),
     ]
 
-    _patch_transformers_flash_linear_attention_available(False)
     modeling_qwen3_5 = import_optional_module('transformers.models.qwen3_5.modeling_qwen3_5')
     modeling_qwen3_5_moe = import_optional_module('transformers.models.qwen3_5_moe.modeling_qwen3_5_moe')
     if modeling_qwen3_5 is not None:
+        _patch_transformers_flash_linear_attention_available()
         patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed()
 
     if modeling_qwen3_5 is not None:

@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MindSpeed 0.15.3 NPU LoRA smoke report: Moonlight and DeepSeek-R1</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fa;
+      --paper: #ffffff;
+      --ink: #18212f;
+      --muted: #596273;
+      --line: #d9dee7;
+      --soft: #edf4ff;
+      --accent: #1769aa;
+      --ok: #18794e;
+      --warn: #966515;
+      --code: #f3f5f8;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.68;
+    }
+    main {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 40px 24px 64px;
+    }
+    article {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 36px;
+      box-shadow: 0 8px 28px rgba(20, 31, 48, 0.06);
+    }
+    h1, h2, h3 {
+      line-height: 1.28;
+      margin: 0 0 14px;
+    }
+    h1 {
+      font-size: 30px;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin-top: 32px;
+      padding-top: 24px;
+      border-top: 1px solid var(--line);
+      font-size: 22px;
+    }
+    h3 {
+      margin-top: 24px;
+      font-size: 18px;
+    }
+    p {
+      margin: 10px 0;
+    }
+    .meta {
+      color: var(--muted);
+      margin-bottom: 20px;
+    }
+    .summary {
+      border-left: 4px solid var(--accent);
+      background: var(--soft);
+      padding: 14px 18px;
+      margin: 18px 0 24px;
+    }
+    ul {
+      margin: 8px 0 16px 22px;
+      padding: 0;
+    }
+    li {
+      margin: 4px 0;
+    }
+    code {
+      background: var(--code);
+      border: 1px solid #e4e8ee;
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+    pre {
+      overflow-x: auto;
+      background: #101827;
+      color: #e7edf7;
+      border-radius: 8px;
+      padding: 14px 16px;
+      line-height: 1.45;
+    }
+    pre code {
+      background: transparent;
+      border: 0;
+      padding: 0;
+      color: inherit;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 20px;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 9px 10px;
+      vertical-align: top;
+      text-align: left;
+    }
+    th {
+      background: #f0f3f7;
+      font-weight: 700;
+    }
+    .ok {
+      color: var(--ok);
+      font-weight: 700;
+    }
+    .risk {
+      color: var(--warn);
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+<main>
+<article>
+  <h1>MindSpeed 0.15.3 NPU LoRA smoke report: Moonlight and DeepSeek-R1</h1>
+  <p class="meta">日期：2026-06-03</p>
+  <div class="summary">
+    <p>这份报告只覆盖 <code>/data/model/Moonlight-16B-A3B-Instruct</code> 和 <code>/data2/model/DeepSeek-R1-BF16</code>。早前 Qwen/FLA 相关临时修改不计入本报告范围。</p>
+    <p>结论：在 MindSpeed 0.15.3 / Megatron-Core 0.15.3 的 NPU 环境下，Moonlight shared expert LoRA 和 DeepSeek-R1 all-linear LoRA 都已经完成多拓扑 smoke 验证。</p>
+  </div>
+
+  <h2>公共环境</h2>
+  <ul>
+    <li>MindSpeed：<code>/data/zyh/code/MindSpeed</code>，<code>core_r0.15.3</code></li>
+    <li>Megatron-LM：<code>/data/zyh/code/Megatron-LM</code>，<code>core_r0.15.3</code></li>
+    <li>Python 环境：<code>/data/zyh/miniconda3/envs/swift_dev_v18_swiftpatch</code></li>
+    <li>关键环境变量：<code>USE_MCORE_GDN=1</code>、<code>MEGATRON_LM_PATH=/data/zyh/code/Megatron-LM</code>、<code>PYTORCH_NPU_ALLOC_CONF=expandable_segments:True</code></li>
+    <li><code>PYTHONPATH</code> 需要包含 mcore-bridge worktree、Megatron-LM、ms-swift worktree，并保留 CANN 原有路径。</li>
+  </ul>
+
+  <h2>整体根因</h2>
+  <p>问题不在 LoRA 数学公式本身，而在 mcore-bridge 原先只覆盖了 Transformer-Engine 风格的线性层，没完整覆盖 MindSpeed/Megatron NPU patch 后出现的 native Megatron parallel linear、NPU TE full-output 语义、grouped LoRA config shape 语义，以及 shared expert overlap 的 explicit communication 状态。</p>
+  <pre><code>y = x W^T + scale * x A^T B^T</code></pre>
+  <p>在 tensor parallel 下，LoRA 分支和 base 分支必须返回同一种张量分片：如果 base output 是 sharded，LoRA output 也必须 sharded；如果 base output 是 full tensor，LoRA output 也必须 full tensor。否则 <code>base_result + lora_result</code> 在 shape 或通信语义上都不成立。</p>
+
+  <h2>Moonlight-16B-A3B-Instruct</h2>
+  <h3>现象和根因</h3>
+  <p>Moonlight 脚本目标是 <code>.*.mlp.shared_experts.*.</code>，并开启 <code>moe_shared_expert_overlap</code>。shared experts 里的目标层是 Megatron native <code>ColumnParallelLinear</code> / <code>RowParallelLinear</code>，不是 PEFT 默认支持的普通 <code>torch.nn.Linear</code>。</p>
+  <p>MindSpeed 会把 shared expert 的 TP/SP 通信交给外部 overlap 流程控制。LoRA adapter 新建的 A/B 层如果不继承 base layer 的 <code>explicit_expert_comm</code> 等状态，就会按普通 parallel linear 做通信，最终在 token 维度或 hidden 分片上和 base output 不一致。</p>
+
+  <h3>修复点</h3>
+  <ul>
+    <li><code>swift/megatron/trainers/base.py</code>：对 <code>save_safetensors=true</code>、<code>tuner_type=lora</code>、<code>merge_lora=true</code> 且目标模块来自 regex 的场景，跳过中间 PEFT adapter save，让 merged full-weight HF export 继续完成。</li>
+    <li><code>src/mcore_bridge/config/model_config.py</code>：保留 <code>rope_scaling.rope_type</code> 到 <code>ModelConfig.rope_type</code>。</li>
+    <li><code>src/mcore_bridge/tuners/patcher.py</code>：把 <code>ColumnParallelLinear</code> / <code>RowParallelLinear</code> 加进 LoRA dispatcher 支持类型。</li>
+    <li><code>src/mcore_bridge/tuners/lora.py</code>：为 native row/column parallel linear 构造数学上匹配的 LoRA A/B；关闭 adapter 的 gradient accumulation fusion；继承 <code>explicit_expert_comm</code>，保持 shared expert overlap 通信语义一致。</li>
+  </ul>
+
+  <h3>验证</h3>
+  <table>
+    <thead>
+      <tr><th>拓扑</th><th>卡数</th><th>结果</th><th>step 10 / eval</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>TP=1, PP=2, EP=1</td><td>2</td><td class="ok">成功，checkpoint-10</td><td>loss 2.34023118，eval_loss 2.3043375</td></tr>
+      <tr><td>TP=4, PP=2, EP=1</td><td>8</td><td class="ok">成功，checkpoint-10</td><td>loss 2.28295517，eval_loss 2.25864434</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li>TP=1 日志：<code>/data/zyh/tmp/moonlight_lora_smoke/tp1_pp2_ep1_n2_after_explicit_comm/v0-20260603-140027/logging.jsonl</code></li>
+    <li>TP=4 日志：<code>/data/zyh/tmp/moonlight_lora_smoke/tp4_pp2_ep1_n8_after_explicit_comm/v0-20260603-135705/logging.jsonl</code></li>
+    <li>Moonlight merged HF artifact：<code>/data/zyh/code/ms-swift/megatron_output/moonlight_mindspeed0153_npu/v10-20260602-162903/checkpoint-19-merged</code></li>
+  </ul>
+  <p>merged artifact 的 <code>model.safetensors.index.json</code> 可解析，7 个 safetensors shard 均可读；示例 shared expert tensor 与 base 存在非零差异，说明 LoRA merge 写入了权重变化。</p>
+
+  <h2>DeepSeek-R1-BF16</h2>
+  <h3>现象和根因</h3>
+  <p>DeepSeek-R1-BF16 使用 DeepSeekV3-style 结构，smoke 目标是 <code>--target_modules all-linear</code>。在更高 TP/PP/EP 拓扑下，部分 NPU TE patched layer 在 TP&gt;1 时仍返回 full output，而不是普通 column-parallel 的 per-partition output；同时 grouped LoRA 的 config hidden size 也需要等于 adapter 的真实输入维度。</p>
+  <p>如果 LoRA adapter 仍按普通 TE column-parallel 或原始 model hidden size 构造，就会得到数学上不匹配的 adapter shape。</p>
+
+  <h3>修复点</h3>
+  <ul>
+    <li><code>src/mcore_bridge/tuners/lora.py</code>：增加 <code>_base_outputs_full_tensor()</code>，检测 NPU patched base layer 是否返回 full output；如果 base 是 full output，LoRA B 也构造成本地 full-output adapter。</li>
+    <li><code>src/mcore_bridge/tuners/lora.py</code>：增加 <code>_with_lora_input_size()</code>，为 grouped LoRA A/B 拷贝 config 并设置真实 adapter input size。</li>
+    <li><code>src/mcore_bridge/tuners/lora.py</code>：对旧 NPU/无 TE 场景保留 <code>nn.Linear</code> fallback；对 <code>parallel_mode</code> / UB overlap 属性使用 guard。</li>
+  </ul>
+
+  <h3>验证</h3>
+  <table>
+    <thead>
+      <tr><th>拓扑</th><th>卡数</th><th>结果</th><th>step 10 loss</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>TP=1, PP=1, EP=2</td><td>2</td><td class="ok">成功，checkpoint-10</td><td>12.80538177</td></tr>
+      <tr><td>TP=2, PP=1, EP=4</td><td>8</td><td class="ok">成功，checkpoint-10</td><td>13.02271652</td></tr>
+      <tr><td>TP=2, PP=2, EP=2</td><td>8</td><td class="ok">成功，checkpoint-10</td><td>13.01743984</td></tr>
+      <tr><td>TP=4, PP=1, EP=2</td><td>8</td><td class="ok">成功，checkpoint-10</td><td>13.02410698</td></tr>
+      <tr><td>TP=1, PP=4, EP=2</td><td>8</td><td class="ok">成功，checkpoint-10</td><td>13.0034771</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li>TP=1, PP=1, EP=2：<code>/data/zyh/tmp/deepseek_r1_lora_smoke/tp1_pp1_ep2_n2/v2-20260603-130002/logging.jsonl</code></li>
+    <li>TP=2, PP=1, EP=4：<code>/data/zyh/tmp/deepseek_r1_lora_smoke/tp2_pp1_ep4_n8/v0-20260603-132435/logging.jsonl</code></li>
+    <li>TP=2, PP=2, EP=2：<code>/data/zyh/tmp/deepseek_r1_lora_smoke/tp2_pp2_ep2_n8/v0-20260603-132723/logging.jsonl</code></li>
+    <li>TP=4, PP=1, EP=2：<code>/data/zyh/tmp/deepseek_r1_lora_smoke/tp4_pp1_ep2_n8/v0-20260603-133621/logging.jsonl</code></li>
+    <li>TP=1, PP=4, EP=2：<code>/data/zyh/tmp/deepseek_r1_lora_smoke/tp1_pp4_ep2_n8/v0-20260603-133845/logging.jsonl</code></li>
+  </ul>
+  <p>DeepSeek slice 有 256 routed experts，MindSpeed 对每个 EP group 的 experts 数量有限制提示；实测有效拓扑使用 <code>EP&gt;=2</code>。</p>
+
+  <h2>运行脚本</h2>
+  <ul>
+    <li><code>tasks/moonlight_mindspeed0153_npu.sh</code></li>
+    <li><code>tasks/deepseek_r1_lora_tp_pp_ep_smoke.sh</code></li>
+  </ul>
+  <pre><code>ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+NPROC_PER_NODE=8 \
+TP=4 PP=1 EP=2 \
+tasks/deepseek_r1_lora_tp_pp_ep_smoke.sh</code></pre>
+
+  <h2>剩余风险</h2>
+  <ul>
+    <li><span class="risk">未声明 GPU 等价：</span>本报告验证的是 NPU / MindSpeed 0.15.3 / Megatron-Core 0.15.3 路径。</li>
+    <li>DeepSeek-R1-BF16 smoke 覆盖 10 step 训练和 checkpoint 写出，没有做 merged HF export。</li>
+    <li>Moonlight merged HF artifact 做了 shard 可读和示例 shared expert tensor diff 检查，但没有在下游推理框架做完整加载推理回归。</li>
+    <li>ETP 仍未支持，代码中保留 <code>LoRA does not support ETP</code> 限制。</li>
+  </ul>
+</article>
+</main>
+</body>
+</html>

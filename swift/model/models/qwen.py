@@ -11,10 +11,10 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.models.auto.tokenization_auto import get_tokenizer_config
 
 try:
-    from transformers.utils.import_utils import is_flash_linear_attention_available as _is_flash_linear_attention_available
+    from transformers.utils.import_utils import is_flash_linear_attention_available
 except ImportError:
 
-    def _is_flash_linear_attention_available():
+    def is_flash_linear_attention_available():
         return False
 
 
@@ -34,15 +34,6 @@ from ..utils import AttnImpl, use_submodel_func
 
 logger = get_logger()
 dtype_mapping = {torch.float16: 'fp16', torch.bfloat16: 'bf16', torch.float32: 'fp32'}
-
-
-def is_flash_linear_attention_available():
-    try:
-        return _is_flash_linear_attention_available()
-    except version.InvalidVersion as e:
-        logger.warning(f'Failed to parse flash-linear-attention version: {e}')
-        return False
-
 
 if is_flash_linear_attention_available():
     try:
