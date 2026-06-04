@@ -11,10 +11,10 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.models.auto.tokenization_auto import get_tokenizer_config
 
 try:
-    from transformers.utils.import_utils import is_flash_linear_attention_available
+    from transformers.utils.import_utils import is_flash_linear_attention_available as _is_flash_linear_attention_available
 except ImportError:
 
-    def is_flash_linear_attention_available():
+    def _is_flash_linear_attention_available():
         return False
 
 
@@ -34,6 +34,15 @@ from ..utils import AttnImpl, use_submodel_func
 
 logger = get_logger()
 dtype_mapping = {torch.float16: 'fp16', torch.bfloat16: 'bf16', torch.float32: 'fp32'}
+
+
+def is_flash_linear_attention_available():
+    try:
+        return _is_flash_linear_attention_available()
+    except version.InvalidVersion as e:
+        logger.warning(f'Failed to parse flash-linear-attention version: {e}')
+        return False
+
 
 if is_flash_linear_attention_available():
     try:
@@ -1409,11 +1418,35 @@ def _patch_qwen3_5_linear_attention_sequence_parallel() -> None:
     Qwen3_5GatedDeltaNet._ms_swift_sp_linear_patched = True
 
 
+def _patch_qwen3_5_no_split_modules() -> None:
+    try:
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
+    except Exception:
+        Qwen3_5Model = None
+    try:
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeModel
+    except Exception:
+        Qwen3_5MoeModel = None
+
+    replacements = {
+        Qwen3_5Model: ('Qwen3_5TextDecoderLayer', 'Qwen3_5DecoderLayer'),
+        Qwen3_5MoeModel: ('Qwen3_5MoeTextDecoderLayer', 'Qwen3_5MoeDecoderLayer'),
+    }
+    for model_cls, (old, new) in replacements.items():
+        if model_cls is None:
+            continue
+        no_split_modules = getattr(model_cls, '_no_split_modules', None)
+        if not no_split_modules or old not in no_split_modules:
+            continue
+        model_cls._no_split_modules = [new if module == old else module for module in no_split_modules]
+
+
 class Qwen3_5MoeLoader(Qwen3VLLoader):
 
     def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
         from transformers import Qwen3_5MoeForConditionalGeneration
         self.auto_model_cls = self.auto_model_cls or Qwen3_5MoeForConditionalGeneration
+        _patch_qwen3_5_no_split_modules()
         _patch_qwen3_5_linear_attention_sequence_parallel()
         return Qwen2VLLoader.get_model(self, model_dir, config, processor, model_kwargs)
 
@@ -1451,6 +1484,7 @@ class Qwen3_5Loader(Qwen3VLLoader):
     def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
         from transformers import Qwen3_5ForConditionalGeneration
         self.auto_model_cls = self.auto_model_cls or Qwen3_5ForConditionalGeneration
+        _patch_qwen3_5_no_split_modules()
         _patch_qwen3_5_linear_attention_sequence_parallel()
         return Qwen2VLLoader.get_model(self, model_dir, config, processor, model_kwargs)
 

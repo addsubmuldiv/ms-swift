@@ -88,6 +88,22 @@ def _patch_vllm_dp_coordinator_timeout():
 _patch_vllm_dp_coordinator_timeout()
 
 
+def _prepare_vllm_external_launcher_env(distributed_executor_backend: Optional[str]) -> None:
+    if distributed_executor_backend != 'external_launcher':
+        return
+
+    # vLLM V1 external_launcher runs one engine per torchrun rank. vLLM also
+    # sets this later in ParallelConfig, but envs may already have cached the
+    # previous default by then.
+    os.environ['VLLM_ENABLE_V1_MULTIPROCESSING'] = '0'
+    try:
+        from vllm import envs
+        envs.disable_envs_cache()
+        setattr(envs, 'VLLM_ENABLE_V1_MULTIPROCESSING', False)
+    except Exception as e:
+        logger.debug(f'Failed to reset vLLM env cache for external_launcher: {e}')
+
+
 class VllmEngine(InferEngine):
 
     def __init__(
@@ -176,6 +192,7 @@ class VllmEngine(InferEngine):
         self.num_labels = num_labels
         self.reranker_use_activation = reranker_use_activation
         self._config_cls = None
+        _prepare_vllm_external_launcher_env(self.distributed_executor_backend)
 
         patch_vllm_memory_leak()
         patch_vllm_triton_device_guard()
@@ -226,6 +243,7 @@ class VllmEngine(InferEngine):
         with patch_auto_tokenizer(self.tokenizer), self._patch_auto_config(), \
                 disable_deepspeed_zero3():
             llm_engine_cls = AsyncLLMEngine if self.use_async_engine else LLMEngine
+            _prepare_vllm_external_launcher_env(self.distributed_executor_backend)
             engine = llm_engine_cls.from_engine_args(self.engine_args)
         self.engine = engine
 
