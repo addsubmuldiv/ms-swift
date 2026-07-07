@@ -618,6 +618,55 @@ swift sft \
 
 更多参数含义可以在[命令行参数文档](../Instruction/Command-line-parameters.md)中查询。
 
+### Megatron-SWIFT NPU Profiling
+
+Megatron-SWIFT 在 NPU 上支持通过 `torch_npu.profiler.profile` 进行性能数据采集，不需要再手动修改训练循环。设置 `--npu_profile true` 后，指定 rank 会在训练过程中按 `torch_npu.profiler.schedule` 的语义采集 CPU/NPU trace，并将解析结果写入 `--npu_profile_output_dir`。
+
+下面示例采集 4 卡训练中所有 rank 的 1 个 active step，跳过第 1 个 step 后开始采集，输出保存在 `./profiler_output`：
+
+```shell
+NPROC_PER_NODE=4 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+megatron sft \
+    --model /path/to/model \
+    --dataset /path/to/dataset \
+    --train_iters 3 \
+    --npu_profile true \
+    --npu_profile_ranks 0 1 2 3 \
+    --npu_profile_output_dir ./profiler_output \
+    --npu_profile_wait 0 \
+    --npu_profile_active 1 \
+    --npu_profile_warmup 0 \
+    --npu_profile_repeat 1 \
+    --npu_profile_skip_first 1 \
+    --npu_profile_level level0 \
+    --npu_profile_export_type text \
+    --npu_profile_aic_metrics none \
+    ...
+```
+
+采集完成后，`--npu_profile_output_dir` 下会生成每个 rank 对应的 `rank*_ascend_pt/ASCEND_PROFILER_OUTPUT` 目录。常用结果文件包括 `analysis.db`、`trace_view.json`、`operator_details.csv`、`kernel_details.csv` 和 `step_trace_time.csv`。
+
+NPU profiling 参数说明如下：
+
+| 参数 | 默认值 | 说明 |
+| ---- | ------ | ---- |
+| `--npu_profile` | `false` | 是否开启 NPU profiling。 |
+| `--npu_profile_ranks` | `0` | 需要采集的全局 rank 列表。多卡场景可设置为 `0 1 2 3`，只采 rank0 可减少采集开销。 |
+| `--npu_profile_output_dir` | `./profiler_output` | NPU profiling 文件保存目录。未指定时默认写入当前工作目录下的 `profiler_output`。 |
+| `--npu_profile_wait` | `0` | 对应 `torch_npu.profiler.schedule(wait=...)`，每轮采集前等待的 step 数。 |
+| `--npu_profile_active` | `2` | 对应 `active=...`，每轮实际采集的 step 数，必须大于 0。 |
+| `--npu_profile_warmup` | `0` | 对应 `warmup=...`，每轮正式采集前的 warmup step 数。 |
+| `--npu_profile_repeat` | `1` | 对应 `repeat=...`，采集循环重复次数。设置为 `0` 时按 `torch_npu.profiler.schedule` 语义持续重复。 |
+| `--npu_profile_skip_first` | `10` | 对应 `skip_first=...`，开始 profiling 前跳过的 step 数。 |
+| `--npu_profile_level` | `level0` | NPU profiler level，可选 `level0`、`level1`、`level2`。采集 AiC 指标时需要使用 `level1` 或 `level2`。 |
+| `--npu_profile_export_type` | `text` | 导出格式，可选 `text`、`db`，也可以同时传入多个值。 |
+| `--npu_profile_aic_metrics` | `none` | AiCore 指标，可选 `none`、`pipe_utilization`、`arithmetic_utilization`、`memory`、`memory_l0`、`memory_ub`、`memory_access`、`resource_conflict_ratio`、`l2_cache`。 |
+
+> [!NOTE]
+>
+> NPU profiling 使用 `torch_npu.profiler.schedule(wait, warmup, active, repeat, skip_first)` 的原生语义。`wait` 是每轮 repeat 内的等待 step，`skip_first` 是整体采集开始前只跳过一次的 step。采集范围过大或对所有 rank 同时采集会显著增加解析耗时和输出文件体积，建议先用较小的 `active` 和少量 rank 定位瓶颈。
+
 ### NPU模型Patch开关
 
 ms-swift 在 NPU 环境下默认会启用模型层 patch，以适配部分 Transformers 模型在昇腾 NPU 上的算子和兼容性需求。通常不需要关闭；如果怀疑某个模型的 loss 异常、forward 报错与 NPU 模型 patch 有关，需要临时切回 Transformers 原生实现做对比，可以设置：

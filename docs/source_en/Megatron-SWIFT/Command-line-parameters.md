@@ -447,6 +447,20 @@ Used in GKD and GRPO.
 - teacher_tag_key: Column name for multi-teacher routing (match sample values to teacher `tags`). Default is `"dataset"`.
 - offload_teacher_model: Whether to offload teacher model to CPU to save GPU memory. Default is False.
 
+## NPU Profiling Parameters
+
+- npu_profile: Whether to enable NPU profiling. Defaults to False.
+- npu_profile_ranks: Global ranks to profile. Defaults to `[0]`.
+- npu_profile_output_dir: Directory for NPU profiling files. Defaults to `./profiler_output`.
+- npu_profile_wait: `wait` in the NPU profiler schedule, the number of steps to wait before each collection cycle. Defaults to 0.
+- npu_profile_active: `active` in the NPU profiler schedule, the number of active profiling steps in each cycle. Defaults to 2.
+- npu_profile_warmup: `warmup` in the NPU profiler schedule, the number of warmup steps before active collection in each cycle. Defaults to 0.
+- npu_profile_repeat: `repeat` in the NPU profiler schedule, the number of collection cycles. Defaults to 1.
+- npu_profile_skip_first: `skip_first` in the NPU profiler schedule, the number of steps skipped before profiling starts. Defaults to 10.
+- npu_profile_level: NPU profiler level. Available values are `level0`, `level1`, and `level2`. Defaults to `level0`.
+- npu_profile_export_type: NPU profiler export format. Available values are `text` and `db`. Defaults to `["text"]`.
+- npu_profile_aic_metrics: NPU profiler AiCore metric. Available values are `none`, `pipe_utilization`, `arithmetic_utilization`, `memory`, `memory_l0`, `memory_ub`, `memory_access`, `resource_conflict_ratio`, and `l2_cache`. Defaults to `none`.
+
 ## Export Parameters
 
 This section introduces the parameters for `megatron export`. To use the `swift export` command for exporting, please refer to the [ms-swift Command Line Parameters Documentation](../Instruction/Command-line-parameters.md#export-arguments). Compared to `swift export`, `megatron export` supports distributed and multi-node exporting. Megatron export parameters inherit from Megatron parameters and basic parameters.

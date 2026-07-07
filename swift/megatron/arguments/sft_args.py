@@ -48,6 +48,8 @@ class MegatronSftArguments(MegatronBaseArguments):
         if self.tensorboard_dir is None and self.output_dir is not None:
             self.tensorboard_dir = f'{self.output_dir}/runs'
         self.tensorboard_dir = to_abspath(self.tensorboard_dir)
+        if self.npu_profile_output_dir is not None:
+            self.npu_profile_output_dir = to_abspath(self.npu_profile_output_dir)
         if self.mcore_model is None and self.model is None and not self.perform_initialization:
             raise ValueError('You did not pass `--mcore_model/--model` to read weights, so you need to set '
                              '`--perform_initialization true` to allow the model to initialize weights properly.')

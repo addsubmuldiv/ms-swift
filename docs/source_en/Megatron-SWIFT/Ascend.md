@@ -4,37 +4,7 @@ For environment preparation of Megatron-SWIFT on Ascend NPU, please refer to [NP
 
 ## NPU Performance Data Collection
 
-NPU performance collection is conducted through the `torch_npu.profiler.profile` interface. To begin, create an instance of `torch_npu.profiler.profile`, then use the `start` and `stop` methods to control the performance data collection process. During this process, modifications to the ms-swift source code are required, specifically altering the `train` function in the `swift/megatron/trainers/base.py` file. Below is an example of the collection process:
-
-```python
-import torch_npu
-...
-
-experimental_config = torch_npu.profiler._ExperimentalConfig(
-    profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-    aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-)
-
-prof = torch_npu.profiler.profile(
-    activities=[
-        torch_npu.profiler.ProfilerActivity.CPU,
-        torch_npu.profiler.ProfilerActivity.NPU
-        ],
-    schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=6),
-    on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./result"),
-    profile_memory=False, # Close the collection of memory information
-    with_stack=False,    # Close the collection of stack information
-    experimental_config=experimental_config)
-prof.start()
-# ms-swift code
-while state.iteration < args.train_iters:
-  ...
-  metric, grad_norm, update_successful = train_step(train_data_iterator)
-  # collect performance data
-  prof.step()
-  ...
-prof.stop()
-```
+Megatron-SWIFT now supports collecting NPU performance data through `torch_npu.profiler.profile` using command-line arguments. You no longer need to modify the training loop manually. For profiling arguments, schedule semantics, and example commands, see [Megatron-SWIFT NPU Profiling in NPU Best Practices](../BestPractices/NPU-support.md#megatron-swift-npu-profiling).
 
 # NPU Accuracy Data Collection
 ### Installing msprobe

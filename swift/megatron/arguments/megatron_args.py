@@ -618,6 +618,29 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     swanlab_project: str = 'megatron-swift'
     swanlab_exp_name: Optional[str] = None
 
+    # profiler
+    npu_profile: bool = False
+    npu_profile_ranks: List[int] = field(default_factory=lambda: [0])
+    npu_profile_output_dir: Optional[str] = './profiler_output'
+    npu_profile_wait: int = 0
+    npu_profile_active: int = 2
+    npu_profile_warmup: int = 0
+    npu_profile_repeat: int = 1
+    npu_profile_skip_first: int = 10
+    npu_profile_level: Literal['level0', 'level1', 'level2'] = 'level0'
+    npu_profile_export_type: List[str] = field(default_factory=lambda: ['text'])
+    npu_profile_aic_metrics: Literal[
+        'none',
+        'pipe_utilization',
+        'arithmetic_utilization',
+        'memory',
+        'memory_l0',
+        'memory_ub',
+        'memory_access',
+        'resource_conflict_ratio',
+        'l2_cache',
+    ] = 'none'
+
     # evaluate
     eval_iters: int = -1
     eval_steps: Optional[int] = None
@@ -780,6 +803,27 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             self.vit_gradient_checkpointing = not self.freeze_vit
         if isinstance(self.report_to, str):
             self.report_to = [self.report_to]
+        if isinstance(self.npu_profile_export_type, str):
+            self.npu_profile_export_type = [self.npu_profile_export_type]
+        invalid_export_type = set(self.npu_profile_export_type) - {'text', 'db'}
+        if invalid_export_type:
+            raise ValueError(f'Unsupported npu_profile_export_type: {sorted(invalid_export_type)}. '
+                             'Supported values: text, db.')
+        if self.npu_profile:
+            if not is_torch_npu_available():
+                raise ValueError('`npu_profile` requires torch_npu and an available NPU runtime.')
+            if self.npu_profile_wait < 0:
+                raise ValueError('`npu_profile_wait` must be greater than or equal to 0.')
+            if self.npu_profile_active <= 0:
+                raise ValueError('`npu_profile_active` must be greater than 0.')
+            if self.npu_profile_warmup < 0:
+                raise ValueError('`npu_profile_warmup` must be greater than or equal to 0.')
+            if self.npu_profile_repeat < 0:
+                raise ValueError('`npu_profile_repeat` must be greater than or equal to 0.')
+            if self.npu_profile_skip_first < 0:
+                raise ValueError('`npu_profile_skip_first` must be greater than or equal to 0.')
+            if self.npu_profile_aic_metrics != 'none' and self.npu_profile_level == 'level0':
+                raise ValueError('`npu_profile_aic_metrics` requires `npu_profile_level` to be level1 or level2.')
         self.model_info, self.model_meta = get_model_info_meta(
             self.model, model_type=self.model_type, use_hf=self.use_hf, hub_token=self.hub_token)
 
@@ -817,6 +861,8 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
                 logger.warning('apex is not installed, so gradient accumulation fusion is disabled.')
                 self.gradient_accumulation_fusion = False
         self.callbacks += ['print', 'default_flow']
+        if self.npu_profile and 'npu_profiler' not in self.callbacks:
+            self.callbacks.append('npu_profiler')
         self.callbacks += self.report_to
         if self.save_total_limit is not None:
             if self.async_save:

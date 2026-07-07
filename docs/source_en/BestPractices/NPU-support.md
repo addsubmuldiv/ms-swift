@@ -636,6 +636,55 @@ When tuning parameters, focus on memory, throughput, and stability:
 
 For more parameter details, see [Command-line Parameters](../Instruction/Command-line-parameters.md).
 
+### Megatron-SWIFT NPU Profiling
+
+Megatron-SWIFT supports performance profiling on NPUs through `torch_npu.profiler.profile`. You no longer need to modify the training loop manually. After setting `--npu_profile true`, the selected ranks collect CPU/NPU traces during training according to the semantics of `torch_npu.profiler.schedule`, and write the parsed results to `--npu_profile_output_dir`.
+
+The following example profiles one active step on all ranks in a 4-card training run. It skips the first step before collection starts and writes results to `./profiler_output`:
+
+```shell
+NPROC_PER_NODE=4 \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+megatron sft \
+    --model /path/to/model \
+    --dataset /path/to/dataset \
+    --train_iters 3 \
+    --npu_profile true \
+    --npu_profile_ranks 0 1 2 3 \
+    --npu_profile_output_dir ./profiler_output \
+    --npu_profile_wait 0 \
+    --npu_profile_active 1 \
+    --npu_profile_warmup 0 \
+    --npu_profile_repeat 1 \
+    --npu_profile_skip_first 1 \
+    --npu_profile_level level0 \
+    --npu_profile_export_type text \
+    --npu_profile_aic_metrics none \
+    ...
+```
+
+After collection finishes, `--npu_profile_output_dir` contains one `rank*_ascend_pt/ASCEND_PROFILER_OUTPUT` directory for each profiled rank. Common output files include `analysis.db`, `trace_view.json`, `operator_details.csv`, `kernel_details.csv`, and `step_trace_time.csv`.
+
+NPU profiling arguments:
+
+| Argument | Default | Description |
+| -------- | ------- | ----------- |
+| `--npu_profile` | `false` | Enable NPU profiling. |
+| `--npu_profile_ranks` | `0` | Global ranks to profile. For multi-card runs, use values such as `0 1 2 3`; profiling only rank 0 reduces collection overhead. |
+| `--npu_profile_output_dir` | `./profiler_output` | Directory for NPU profiling files. If not specified, results are written to `profiler_output` under the current working directory. |
+| `--npu_profile_wait` | `0` | Maps to `torch_npu.profiler.schedule(wait=...)`: number of steps to wait before each collection cycle. |
+| `--npu_profile_active` | `2` | Maps to `active=...`: number of active profiling steps per cycle. Must be greater than 0. |
+| `--npu_profile_warmup` | `0` | Maps to `warmup=...`: number of warmup steps before active collection in each cycle. |
+| `--npu_profile_repeat` | `1` | Maps to `repeat=...`: number of collection cycles. `0` follows the `torch_npu.profiler.schedule` semantics for continuous repetition. |
+| `--npu_profile_skip_first` | `10` | Maps to `skip_first=...`: number of steps skipped once before profiling starts. |
+| `--npu_profile_level` | `level0` | NPU profiler level. Available values are `level0`, `level1`, and `level2`. AiC metrics require `level1` or `level2`. |
+| `--npu_profile_export_type` | `text` | Export format. Available values are `text` and `db`; multiple values can be passed together. |
+| `--npu_profile_aic_metrics` | `none` | AiCore metric. Available values are `none`, `pipe_utilization`, `arithmetic_utilization`, `memory`, `memory_l0`, `memory_ub`, `memory_access`, `resource_conflict_ratio`, and `l2_cache`. |
+
+> [!NOTE]
+>
+> NPU profiling follows the native `torch_npu.profiler.schedule(wait, warmup, active, repeat, skip_first)` semantics. `wait` is the waiting step count inside each repeat cycle, while `skip_first` is applied once before profiling starts. Profiling too many steps or all ranks at once can significantly increase parsing time and output size. Start with a small `active` value and a small set of ranks when locating bottlenecks.
+
 ### NPU Model Patch Switch
 
 ms-swift enables model-level patches by default in NPU environments to adapt some Transformers models to Ascend NPU operators and compatibility requirements. You usually do not need to disable them. If you suspect abnormal loss or forward errors are related to the NPU model patch and want to compare against native Transformers behavior, set:

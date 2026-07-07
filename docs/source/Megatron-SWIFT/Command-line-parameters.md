@@ -423,6 +423,19 @@ Megatron训练参数继承自Megatron参数和基本参数（**与ms-swift共用
 - teacher_tag_key: 多 teacher 路由时样本匹配 teacher `tags` 的字段名，默认为 `"dataset"`。
 - offload_teacher_model: 是否将教师模型卸载到 CPU 以节省 GPU 显存。默认为False。
 
+## NPU Profiling参数
+
+- npu_profile: 是否开启NPU profiling。默认为False。
+- npu_profile_ranks: 需要采集的全局rank列表。默认为`[0]`。
+- npu_profile_output_dir: NPU profiling文件保存目录。默认为`./profiler_output`。
+- npu_profile_wait: NPU profiler schedule中的`wait`，每轮采集前等待的step数。默认为0。
+- npu_profile_active: NPU profiler schedule中的`active`，每轮实际采集的step数。默认为2。
+- npu_profile_warmup: NPU profiler schedule中的`warmup`，每轮正式采集前的warmup step数。默认为0。
+- npu_profile_repeat: NPU profiler schedule中的`repeat`，采集循环重复次数。默认为1。
+- npu_profile_skip_first: NPU profiler schedule中的`skip_first`，开始profiling前跳过的step数。默认为10。
+- npu_profile_level: NPU profiler level，可选为`level0`、`level1`、`level2`。默认为`level0`。
+- npu_profile_export_type: NPU profiler导出格式，可选为`text`、`db`。默认为`["text"]`。
+- npu_profile_aic_metrics: NPU profiler AiCore指标，可选为`none`、`pipe_utilization`、`arithmetic_utilization`、`memory`、`memory_l0`、`memory_ub`、`memory_access`、`resource_conflict_ratio`、`l2_cache`。默认为`none`。
 
 ## 导出参数
 这里介绍`megatron export`的参数，若要使用`swift export`导出命令，请参考[ms-swift命令行参数文档](../Instruction/Command-line-parameters.md#导出参数)。`megatron export`相比`swift export`，支持分布式和多机导出。Megatron导出参数继承自Megatron参数和基本参数。
