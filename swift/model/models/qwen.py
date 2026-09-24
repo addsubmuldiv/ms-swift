@@ -5,6 +5,7 @@ import inspect
 import os
 import torch
 import torch.nn.functional as F
+from torch import nn
 from contextlib import contextmanager
 from functools import wraps
 from importlib import import_module
@@ -15,6 +16,7 @@ from transformers import (AutoConfig, AutoModel, AutoTokenizer, BitsAndBytesConf
                           PreTrainedTokenizerBase)
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.models.auto.tokenization_auto import get_tokenizer_config
+from transformers.utils import is_torch_npu_available
 from transformers.utils.versions import require_version
 from types import MethodType
 from typing import Optional, Tuple, Type, Union
@@ -22,7 +24,8 @@ from typing import Optional, Tuple, Type, Union
 from swift.sequence_parallel import sequence_parallel
 from swift.template import TemplateType
 from swift.utils import (Processor, get_cu_seqlens_from_position_ids, get_device_count, get_dist_setting, get_env_args,
-                         get_logger, is_deepspeed_enabled, safe_snapshot_download, to_device)
+                         get_logger, init_process_group, is_deepspeed_enabled, is_dist, is_master,
+                         safe_snapshot_download, to_device)
 from ..constant import LLMModelType, MLLMModelType, RMModelType
 from ..model_arch import ModelArch
 from ..model_meta import Model, ModelGroup, ModelMeta
@@ -1560,6 +1563,7 @@ def _patch_qwen3_5_linear_attention_sequence_parallel() -> None:
     class_specs = (
         ('transformers.models.qwen3_5.modeling_qwen3_5', 'Qwen3_5GatedDeltaNet'),
         ('transformers.models.qwen3_5_moe.modeling_qwen3_5_moe', 'Qwen3_5MoeGatedDeltaNet'),
+        ('transformers.models.qwen4_exp.modeling_qwen4_exp', 'Qwen4ExpTextGatedDeltaNet'),
     )
     for module_name, class_name in class_specs:
         try:
@@ -1734,12 +1738,170 @@ register_model(
         tags=['vision']))
 
 
+class _HostEmbeddingProxy(nn.Module):
+    """Look up a host-resident embedding table without registering it as an nn.Parameter.
+
+    Qwen4Exp's n-gram PLE table is ~96GiB and must stay on CPU. If it remains a child
+    Parameter of Qwen4ExpTextDecoderLayer, FSDP2 will shard it and all-gather onto NPU.
+    """
+
+    def __init__(self, host_embedding: nn.Embedding):
+        super().__init__()
+        object.__setattr__(self, '_host_embedding', host_embedding)
+
+    @property
+    def weight(self):
+        return self._host_embedding.weight
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        host = self._host_embedding
+        ids = input_ids.to(host.weight.device)
+        out = F.embedding(
+            ids,
+            host.weight,
+            padding_idx=host.padding_idx,
+            max_norm=host.max_norm,
+            norm_type=host.norm_type,
+            scale_grad_by_freq=host.scale_grad_by_freq,
+            sparse=host.sparse,
+        )
+        return out.to(input_ids.device)
+
+
+def _qwen4_exp_ple_ngram_cache_path(model_dir: str) -> str:
+    # The model dir may be read-only (e.g. a container bind mount); allow the cache to
+    # live elsewhere so every rank can still hydrate the host-resident PLE n-gram table.
+    cache_dir = os.environ.get('MS_SWIFT_PLE_NGRAM_CACHE_DIR')
+    base = cache_dir if cache_dir else os.path.join(model_dir, '.ms_swift_cache')
+    return os.path.join(base, 'ple_ngram_embedding.safetensors')
+
+
+def _iter_qwen4_exp_ple_ngram_modules(model: PreTrainedModel):
+    language_model = getattr(getattr(model, 'model', None), 'language_model', None)
+    if language_model is None or not hasattr(language_model, 'layers'):
+        return
+    for layer in language_model.layers:
+        ple = getattr(layer, 'ple', None)
+        if ple is None:
+            continue
+        ngram_mod = getattr(getattr(ple, 'ple_embedding', None), 'ngram_embedding', None)
+        if isinstance(ngram_mod, nn.Embedding):
+            yield ple, ngram_mod
+
+
+def _export_qwen4_exp_ple_ngram_cache(model: PreTrainedModel, cache_path: str) -> None:
+    if os.path.isfile(cache_path):
+        return
+    pairs = list(_iter_qwen4_exp_ple_ngram_modules(model))
+    if not pairs:
+        return
+    weight = pairs[0][1].weight
+    if weight.is_meta:
+        return
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    from safetensors.torch import save_file
+    save_file({'weight': weight.detach().cpu().contiguous()}, cache_path)
+    logger.info(f'Exported Qwen4Exp PLE n-gram cache to {cache_path}')
+
+
+def _load_qwen4_exp_ple_ngram_from_cache(model: PreTrainedModel, cache_path: str) -> None:
+    if not os.path.isfile(cache_path):
+        raise FileNotFoundError(f'Qwen4Exp PLE n-gram cache not found: {cache_path}')
+    pairs = list(_iter_qwen4_exp_ple_ngram_modules(model))
+    if not pairs:
+        return
+    from safetensors import safe_open
+    with safe_open(cache_path, framework='pt', device='cpu') as f:
+        weight = f.get_tensor('weight')
+    for _, ngram_mod in pairs:
+        ngram_mod.weight = nn.Parameter(weight, requires_grad=False)
+    logger.info(f'Loaded Qwen4Exp PLE n-gram embedding from cache: {cache_path}')
+
+
+def _pin_qwen4_exp_ple_ngram_on_host(model: PreTrainedModel) -> None:
+    pinned = 0
+    for ple, ngram_mod in _iter_qwen4_exp_ple_ngram_modules(model):
+        if not ngram_mod.weight.is_meta:
+            ngram_mod.weight.requires_grad_(False)
+        ple_embedding = ple.ple_embedding
+        if not getattr(ple_embedding, '_ms_swift_host_forward_patched', False):
+            original_forward = ple_embedding.forward
+
+            def host_forward(self, input_ids, past_key_values, _original_forward=original_forward):
+                # Training does not use the KV cache. Keep the n-gram hash computation
+                # beside its large host embedding and only transfer the compact result.
+                if past_key_values is not None:
+                    return _original_forward(input_ids, past_key_values)
+                output_device = input_ids.device
+                compute_device = self.layer_multipliers.device
+                return _original_forward(input_ids.to(compute_device), past_key_values).to(output_device)
+
+            ple_embedding.forward = MethodType(host_forward, ple_embedding)
+            ple_embedding._ms_swift_host_forward_patched = True
+        ple.ple_embedding.ngram_embedding = _HostEmbeddingProxy(ngram_mod)
+        pinned += 1
+
+    if pinned:
+        logger.info('Pinned Qwen4Exp PLE n-gram embedding(s) on host CPU and excluded them from FSDP/LoRA.')
+
+
+def _patch_qwen4_exp_qsa_indexer_no_grad() -> None:
+    """QSA indexer is not trained by the causal-LM loss; avoid autograd on its Python-loop forward."""
+    try:
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextQSAIndexer
+    except ImportError:
+        return
+    if getattr(Qwen4ExpTextQSAIndexer.forward, '_ms_swift_no_grad_patched', False):
+        return
+    orig_forward = Qwen4ExpTextQSAIndexer.forward
+
+    def forward(self, *args, **kwargs):
+        with torch.no_grad():
+            return orig_forward(self, *args, **kwargs)
+
+    forward._ms_swift_no_grad_patched = True
+    Qwen4ExpTextQSAIndexer.forward = forward
+
+
 class Qwen4ExpLoader(Qwen3VLLoader):
 
     def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
         from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
+        import torch.distributed as dist
+
         self.auto_model_cls = self.auto_model_cls or Qwen4ExpForConditionalGeneration
-        return Qwen2VLLoader.get_model(self, model_dir, config, processor, model_kwargs)
+        _patch_qwen3_5_linear_attention_sequence_parallel()
+        _patch_qwen4_exp_qsa_indexer_no_grad()
+
+        _, _, world_size, _ = get_dist_setting()
+        cache_path = _qwen4_exp_ple_ngram_cache_path(model_dir)
+        if self.return_dummy_model:
+            # Megatron path: a meta dummy is requested; real weights (including
+            # the PLE n-gram table) are loaded by mcore-bridge straight from the
+            # HF checkpoint, so the swift-side PLE cache/pinning does not apply.
+            return Qwen2VLLoader.get_model(self, model_dir, config, processor, model_kwargs)
+        # Rank0 + meta dummy loading relies on NPU FSDP patches; keep the original path on GPU/CUDA.
+        if is_dist() and world_size > 1 and is_torch_npu_available():
+            init_process_group()
+            if is_master():
+                model = Qwen2VLLoader.get_model(self, model_dir, config, processor, model_kwargs)
+                _export_qwen4_exp_ple_ngram_cache(model, cache_path)
+            else:
+                saved_dummy = self.return_dummy_model
+                self.return_dummy_model = True
+                try:
+                    with torch.device('meta'):
+                        model = Qwen2VLLoader.get_model(self, model_dir, config, processor, model_kwargs)
+                finally:
+                    self.return_dummy_model = saved_dummy
+            dist.barrier()
+            _load_qwen4_exp_ple_ngram_from_cache(model, cache_path)
+        else:
+            model = Qwen2VLLoader.get_model(self, model_dir, config, processor, model_kwargs)
+
+        if is_torch_npu_available():
+            _pin_qwen4_exp_ple_ngram_on_host(model)
+        return model
 
 
 register_model(

@@ -237,20 +237,19 @@ class NpuQwen3_5RMSNorm(nn.Module):
         return f'{tuple(self.weight.shape)}, eps={self.eps}'
 
 
-def npu_apply_rotary_pos_emb_qwen3_5(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def npu_apply_rotary_pos_emb_qwen3_5(q, k=None, cos=None, sin=None, position_ids=None, unsqueeze_dim=1):
     unsqueeze_dim = _resolve_unsqueeze_dim(position_ids, unsqueeze_dim)
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
 
     rotary_dim = cos.shape[-1]
     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    q_embed = torch.cat([torch_npu.npu_rotary_mul(q_rot, cos, sin), q_pass], dim=-1)
+    if k is None:
+        return q_embed
+
     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-    q_rot = torch_npu.npu_rotary_mul(q_rot, cos, sin)
-    k_rot = torch_npu.npu_rotary_mul(k_rot, cos, sin)
-
-    q_embed = torch.cat([q_rot, q_pass], dim=-1)
-    k_embed = torch.cat([k_rot, k_pass], dim=-1)
+    k_embed = torch.cat([torch_npu.npu_rotary_mul(k_rot, cos, sin), k_pass], dim=-1)
     return q_embed, k_embed
 
 

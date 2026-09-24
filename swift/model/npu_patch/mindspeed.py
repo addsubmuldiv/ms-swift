@@ -423,62 +423,80 @@ def patch_mindspeed_te_cp_implementation(megatron_args: dict[str, Any]) -> None:
 
 
 def patch_mindspeed_te_layernorm_linear_frozen_weight() -> None:
-    """Route frozen MindSpeed TE LayerNormLinear weights through Megatron's frozen-weight path."""
+    """Route frozen MindSpeed TE linear weights through Megatron's frozen-weight path."""
     try:
-        ms_te_layernorm_linear = importlib.import_module('mindspeed.te.pytorch.module.layernorm_column_parallel_linear')
         from megatron.core.tensor_parallel.layers import linear_with_frozen_weight
     except ImportError as e:
-        logger.warning('Failed to import MindSpeed TE LayerNormLinear modules: %s', e)
+        logger.warning('Failed to import Megatron frozen-weight implementation: %s', e)
         return
+
+    modules = []
+    for module_name in (
+            'mindspeed.te.pytorch.module.linear',
+            'mindspeed.te.pytorch.module.layernorm_column_parallel_linear',
+    ):
+        try:
+            modules.append(importlib.import_module(module_name))
+        except ImportError as e:
+            logger.warning('Failed to import %s; skip its frozen-weight patch: %s', module_name, e)
 
     linear_impl_name = 'linear_with_grad_accumulation_and_async_allreduce'
-    trainable_weight_impl = getattr(ms_te_layernorm_linear, linear_impl_name, None)
-    if trainable_weight_impl is None:
-        logger.warning('MindSpeed TE LayerNormLinear does not expose %s; skip frozen-weight patch.', linear_impl_name)
-        return
-    if getattr(trainable_weight_impl, '_swift_supports_frozen_weight', False):
-        return
+    patched_modules = []
+    for module in modules:
+        trainable_weight_impl = getattr(module, linear_impl_name, None)
+        if trainable_weight_impl is None:
+            logger.warning('%s does not expose %s; skip frozen-weight patch.', module.__name__, linear_impl_name)
+            continue
+        if getattr(trainable_weight_impl, '_swift_supports_frozen_weight', False):
+            continue
 
-    @wraps(trainable_weight_impl)
-    def linear_with_frozen_weight_dispatch(
-        input,
-        weight,
-        bias,
-        gradient_accumulation_fusion,
-        allreduce_dgrad,
-        sequence_parallel,
-        grad_output_buffer=None,
-        wgrad_deferral_limit=0,
-        async_grad_allreduce=None,
-        tp_group=None,
-    ):
-        if weight.requires_grad:
-            return trainable_weight_impl(
-                input=input,
-                weight=weight,
-                bias=bias,
-                gradient_accumulation_fusion=gradient_accumulation_fusion,
-                allreduce_dgrad=allreduce_dgrad,
-                sequence_parallel=sequence_parallel,
-                grad_output_buffer=grad_output_buffer,
-                wgrad_deferral_limit=wgrad_deferral_limit,
-                async_grad_allreduce=async_grad_allreduce,
-                tp_group=tp_group,
-            )
-        return linear_with_frozen_weight(
-            input=input,
-            weight=weight,
-            bias=bias,
-            gradient_accumulation_fusion=gradient_accumulation_fusion,
-            allreduce_dgrad=allreduce_dgrad,
-            sequence_parallel=sequence_parallel,
-            async_grad_allreduce=async_grad_allreduce,
-            tp_group=tp_group,
-        )
+        def make_dispatch(trainable_impl):
+            @wraps(trainable_impl)
+            def linear_with_frozen_weight_dispatch(
+                input,
+                weight,
+                bias,
+                gradient_accumulation_fusion,
+                allreduce_dgrad,
+                sequence_parallel,
+                grad_output_buffer=None,
+                wgrad_deferral_limit=0,
+                async_grad_allreduce=None,
+                tp_group=None,
+            ):
+                if weight.requires_grad:
+                    return trainable_impl(
+                        input=input,
+                        weight=weight,
+                        bias=bias,
+                        gradient_accumulation_fusion=gradient_accumulation_fusion,
+                        allreduce_dgrad=allreduce_dgrad,
+                        sequence_parallel=sequence_parallel,
+                        grad_output_buffer=grad_output_buffer,
+                        wgrad_deferral_limit=wgrad_deferral_limit,
+                        async_grad_allreduce=async_grad_allreduce,
+                        tp_group=tp_group,
+                    )
+                return linear_with_frozen_weight(
+                    input=input,
+                    weight=weight,
+                    bias=bias,
+                    gradient_accumulation_fusion=gradient_accumulation_fusion,
+                    allreduce_dgrad=allreduce_dgrad,
+                    sequence_parallel=sequence_parallel,
+                    async_grad_allreduce=async_grad_allreduce,
+                    tp_group=tp_group,
+                )
 
-    linear_with_frozen_weight_dispatch._swift_supports_frozen_weight = True
-    setattr(ms_te_layernorm_linear, linear_impl_name, linear_with_frozen_weight_dispatch)
-    logger.info('Patched MindSpeed TE LayerNormLinear to use Megatron frozen-weight backward for frozen weights.')
+            linear_with_frozen_weight_dispatch._swift_supports_frozen_weight = True
+            return linear_with_frozen_weight_dispatch
+
+        setattr(module, linear_impl_name, make_dispatch(trainable_weight_impl))
+        patched_modules.append(module.__name__)
+
+    if patched_modules:
+        logger.info('Patched MindSpeed TE linear modules to use Megatron frozen-weight backward: %s.',
+                    ', '.join(patched_modules))
 
 
 def patch_mindspeed_te_grouped_linear_save_original_input() -> None:
