@@ -3,16 +3,46 @@ import base64
 import os
 import sys
 import tempfile
+import torch
 import types
 import unittest
 from unittest import mock
 
+from swift.template.base import Template
 from swift.template.template_inputs import StdTemplateInputs
 from swift.template.templates.minicpm import MiniCPMO4_5Template
 from swift.template.vision_utils import local_video_path
 
 
 class TestMiniCPMO45Template(unittest.TestCase):
+
+    def test_collator_preserves_text_only_audio_group(self):
+        template = object.__new__(MiniCPMO4_5Template)
+        batch = [{
+            'input_ids': [1, 2],
+            'pixel_values': [],
+            'image_bound': [[]],
+            'tgt_sizes': [],
+            'audio_features': None,
+            'audio_feature_lens': None,
+            'audio_bounds': [[]]
+        }, {
+            'input_ids': [1, 2, 3],
+            'pixel_values': [],
+            'image_bound': [[]],
+            'tgt_sizes': [],
+            'audio_features': torch.ones(1, 80, 20),
+            'audio_feature_lens': [torch.tensor([20])],
+            'audio_bounds': [[[1, 3]]]
+        }]
+        with mock.patch.object(
+                Template, '_data_collator', return_value={}), mock.patch.object(template, '_adjust_bounds_for_padding'):
+            result = template._data_collator(batch)
+        self.assertEqual(len(result['audio_feature_lens']), 2)
+        self.assertEqual(result['audio_feature_lens'][0].numel(), 0)
+        self.assertEqual(result['audio_feature_lens'][1].tolist(), [20])
+        self.assertEqual(result['audio_bounds'], [[], [[1, 3]]])
+        self.assertEqual(result['audio_features'].shape, (1, 80, 20))
 
     @staticmethod
     def _make_template(mode):

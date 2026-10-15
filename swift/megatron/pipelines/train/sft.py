@@ -42,7 +42,7 @@ class MegatronSft(SwiftSft):
         args = self.args
         if apply_mindspeed_patches is not None:
             megatron_args = asdict(self.args)
-            if args.attention_backend != 'local':
+            if getattr(args.attention_backend, 'name', args.attention_backend) != 'local':
                 # MindSpeed requires passing `use_flash_attn` to Megatron
                 # to enable flash attention on Ascend NPU.
                 args.use_flash_attn = True

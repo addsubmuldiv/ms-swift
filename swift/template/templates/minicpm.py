@@ -618,6 +618,10 @@ class MiniCPMO4_5Template(MiniCPMV4_5Template):
                 all_audio_feats.append(af)
             if afl is not None:
                 audio_feature_lens_list.extend(afl)
+            else:
+                # Keep one segment-length group per sample, including text-only
+                # rows mixed into an audio batch.
+                audio_feature_lens_list.append(torch.empty(0, dtype=torch.long))
             if ab is not None:
                 audio_bounds_list.extend(ab)
 

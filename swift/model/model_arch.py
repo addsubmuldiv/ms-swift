@@ -527,8 +527,9 @@ register_model_arch(
     MultiModelKeys(
         MLLMModelArch.minicpmo,
         language_model='llm',
-        aligner='resampler',
+        aligner=['resampler', 'audio_projection_layer'],
         vision_tower=['vpm', 'apm'],
+        generator='tts',
     ))
 
 register_model_arch(

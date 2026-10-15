@@ -4,6 +4,8 @@ ms-swift引入了Megatron的并行技术来加速多模态大模型的训练。�
 
 环境准备请参考Megatron-SWIFT的[快速开始文档](./Quick-start.md)。
 
+MiniCPM-o 4.5 的音频输入、文本输出 SFT、NPU 验证范围和已知限制见[专用说明](./MiniCPM-o-4.5.md)。
+
 ## Dense模型
 
 这里介绍使用2卡80GiB A100对Qwen2.5-VL-7B-Instruct模型进行Latex-OCR的微调，分别使用全参数和LoRA的方式，以下最佳实践可以在10分钟内完成。

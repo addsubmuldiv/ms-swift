@@ -39,6 +39,30 @@ class _FakeAutoBridge:
 @unittest.skipUnless(utils is not None, f'Megatron dependencies not available: {_IMPORT_ERROR}')
 class TestMegatronModelUtils(unittest.TestCase):
 
+    def test_npu_local_attention_is_not_overridden_by_enum_conversion(self):
+        from megatron.core.transformer.enums import AttnBackend
+        for backend in ('local', AttnBackend.local, AttnBackend.flash):
+            with self.subTest(backend=backend):
+                config = SimpleNamespace(attention_backend=AttnBackend.local, use_flash_attn=False)
+                args = SimpleNamespace(
+                    megatron_model_meta=SimpleNamespace(model_type='minicpmo', config_cls=lambda **kwargs: config),
+                    attention_backend=backend,
+                    torch_dtype=None,
+                    task_type='causal_lm',
+                    decoder_first_pipeline_num_layers=None,
+                    decoder_last_pipeline_num_layers=None,
+                    fp4_param_gather=False,
+                    fp8_param_gather=False,
+                    router_replay_mode='disabled',
+                    megatron_extra_kwargs=None,
+                    padding_free=False)
+                with patch.object(
+                        utils, 'fields', return_value=[]), patch.object(
+                            utils, 'hf_to_mcore_config', return_value={}), patch.object(
+                                utils, 'is_torch_npu_available', return_value=True):
+                    result = utils.get_mcore_model_config(args, SimpleNamespace())
+                self.assertEqual(result.use_flash_attn, backend == AttnBackend.flash)
+
     def test_mtp_shared_weights_maps_to_megatron_bridge_field(self):
         auto_bridge_module = types.ModuleType('megatron.bridge.models.conversion.auto_bridge')
         auto_bridge_module.AutoBridge = _FakeAutoBridge

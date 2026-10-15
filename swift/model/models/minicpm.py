@@ -141,7 +141,66 @@ class MiniCPMO2Loader(MiniCPMV2Loader):
     def get_model(self, model_dir: str, config, *args, **kwargs) -> PreTrainedModel:
         config.init_tts = strtobool(get_env_args('init_tts', str, 'false'))
         config.init_audio = strtobool(get_env_args('init_audio', str, 'true'))
-        return super().get_model(model_dir, config, *args, **kwargs)
+        if getattr(config, 'version', None) == '4.5':
+            from functools import wraps
+            from packaging.version import parse
+            from transformers import __version__
+            from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+            if parse(__version__) >= parse('5.0'):
+                model_cls = get_class_from_dynamic_module('modeling_minicpmo.MiniCPMO', model_dir)
+                if not getattr(model_cls, '_swift_post_init', False):
+                    original_init = model_cls.__init__
+
+                    @wraps(original_init)
+                    def __init__(self, *args, **kwargs):
+                        original_init(self, *args, **kwargs)
+                        # The remote composite model omits the initialization of
+                        # tied-weight metadata required by Transformers 5 loaders.
+                        self.post_init()
+
+                    model_cls.__init__ = __init__
+                    model_cls._swift_post_init = True
+                self.auto_model_cls = model_cls
+        model = super().get_model(model_dir, config, *args, **kwargs)
+        if getattr(config, 'version', None) == '4.5':
+            if hasattr(model, 'apm'):
+                _patch_minicpmo_whisper_attention(model.apm)
+            if parse(__version__) >= parse('5.0'):
+                from transformers import Qwen3ForCausalLM
+
+                # The remote override reads removed cache.seen_tokens and
+                # cache_position APIs. Native Qwen3 handles non-streaming decode.
+                model.llm.prepare_inputs_for_generation = MethodType(Qwen3ForCausalLM.prepare_inputs_for_generation,
+                                                                     model.llm)
+        return model
+
+
+def _patch_minicpmo_whisper_attention(encoder):
+    """Adapt the remote encoder's legacy attention tuple without changing weights."""
+    from functools import wraps
+    from packaging.version import parse
+    from transformers import __version__
+
+    if parse(__version__) < parse('5.0'):
+        return
+    for layer in encoder.layers:
+        attention = layer.self_attn
+        if getattr(attention, '_swift_legacy_tuple', False):
+            continue
+
+        def wrap_forward(original):
+
+            @wraps(original)
+            def forward(*args, **kwargs):
+                cache = kwargs.pop('past_key_value', None)
+                result = original(*args, past_key_values=cache, **kwargs)
+                return (*result, cache)
+
+            return forward
+
+        attention.forward = wrap_forward(attention.forward)
+        attention._swift_legacy_tuple = True
 
 
 register_model(
